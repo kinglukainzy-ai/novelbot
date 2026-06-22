@@ -47,12 +47,12 @@ class TelegramAdapter:
 
     async def _reply_safe(self, message, text: str):
         """Send a reply, chunked for length, falling back to plain text if
-        Markdown parsing fails (e.g. unescaped _ * ` [ in titles/content)."""
+        HTML parsing fails (e.g. malformed tags in content)."""
         for chunk in _chunk_text(text):
             try:
-                await message.reply_text(chunk, parse_mode="Markdown")
+                await message.reply_text(chunk, parse_mode="HTML")
             except BadRequest as e:
-                logger.warning(f"Markdown parse failed ({e}), retrying as plain text")
+                logger.warning(f"HTML parse failed ({e}), retrying as plain text")
                 await message.reply_text(chunk)
 
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,9 +91,9 @@ class TelegramAdapter:
             for chat_id in self._known_chat_ids:
                 for chunk in _chunk_text(text):
                     try:
-                        await self.app.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+                        await self.app.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
                     except BadRequest as e:
-                        logger.warning(f"Markdown parse failed for chat {chat_id} ({e}), retrying as plain text")
+                        logger.warning(f"HTML parse failed for chat {chat_id} ({e}), retrying as plain text")
                         try:
                             await self.app.bot.send_message(chat_id=chat_id, text=chunk)
                         except Exception as e2:

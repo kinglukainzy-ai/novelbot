@@ -210,3 +210,34 @@ class Storage:
                 "by_status": {r["status"]: r["n"] for r in by_status},
                 "by_type": {r["type"]: r["n"] for r in by_type},
             }
+
+    def search_items(self, query):
+        """Case-insensitive title search using LIKE."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM items WHERE title LIKE ? ORDER BY id DESC",
+                (f"%{query}%",),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def broken_items(self):
+        """Items where broken=1."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM items WHERE broken=1 ORDER BY id DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def recently_updated_items(self, days=7):
+        """Items that had an update event (new_chapter/new_episode) in the last N days."""
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT DISTINCT items.* FROM items
+                   JOIN history ON items.id = history.item_id
+                   WHERE history.event IN ('new_chapter', 'new_episode')
+                     AND history.created_at >= ?
+                   ORDER BY history.created_at DESC""",
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]

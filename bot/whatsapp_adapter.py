@@ -12,6 +12,33 @@ from flask import Flask, request
 logger = logging.getLogger("whatsapp_adapter")
 
 GRAPH_API_URL = "https://graph.facebook.com/v20.0"
+WHATSAPP_MAX_LEN = 4096
+
+
+def _html_to_whatsapp(text: str) -> str:
+    """Translate HTML tags/entities to WhatsApp markdown/text."""
+    # Convert HTML bold to WhatsApp bold
+    text = text.replace("<b>", "*").replace("</b>", "*")
+    # Unescape HTML entities
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return text
+
+
+def _chunk_text(text: str, max_len: int = WHATSAPP_MAX_LEN):
+    """Split text into <= max_len chunks, breaking on newlines where possible."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
 
 
 class WhatsAppAdapter:
@@ -100,14 +127,14 @@ class WhatsAppAdapter:
         def health():
             return "ok", 200
 
-    def _send(self, to_number: str, text: str):
+    def _send_single(self, to_number: str, text: str):
         url = f"{GRAPH_API_URL}/{self.phone_number_id}/messages"
         headers = {"Authorization": f"Bearer {self.token}"}
         payload = {
             "messaging_product": "whatsapp",
             "to": to_number,
             "type": "text",
-            "text": {"body": text[:4096]},  # WhatsApp message length limit
+            "text": {"body": text},
         }
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=15)
@@ -118,12 +145,20 @@ class WhatsAppAdapter:
         except requests.RequestException as e:
             logger.error(f"WhatsApp send error: {e}", exc_info=True)
 
+    def _send(self, to_number: str, text: str):
+        text_wa = _html_to_whatsapp(text)
+        for chunk in _chunk_text(text_wa):
+            self._send_single(to_number, chunk)
+
     def send_to_all_known(self, text: str):
         """Used by the scheduler to push proactive notifications."""
         success_count = 0
+        text_wa = _html_to_whatsapp(text)
+        chunks = _chunk_text(text_wa)
         for number in self._known_numbers:
             try:
-                self._send(number, text)
+                for chunk in chunks:
+                    self._send_single(number, chunk)
                 success_count += 1
             except Exception as e:
                 logger.warning(f"Failed to notify WhatsApp number {number}: {e}")

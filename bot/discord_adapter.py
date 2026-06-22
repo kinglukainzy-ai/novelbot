@@ -12,7 +12,33 @@ Only listens to messages from IDs in ALLOWED_DISCORD_IDS.
 import logging
 import discord
 
-logger = logging.getLogger("discord_adapter")
+DISCORD_MAX_LEN = 2000
+
+
+def _html_to_discord(text: str) -> str:
+    """Translate HTML tags/entities to Discord markdown/text."""
+    # Convert HTML bold to Discord bold
+    text = text.replace("<b>", "**").replace("</b>", "**")
+    # Unescape HTML entities
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return text
+
+
+def _chunk_text(text: str, max_len: int = DISCORD_MAX_LEN):
+    """Split text into <= max_len chunks, breaking on newlines where possible."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
 
 
 class DiscordAdapter:
@@ -46,7 +72,10 @@ class DiscordAdapter:
                 reply = self.brain.handle(message.content)
                 if not reply:
                     reply = "(No response generated - this is a bug)"
-                await message.channel.send(reply)
+                
+                reply_md = _html_to_discord(reply)
+                for chunk in _chunk_text(reply_md):
+                    await message.channel.send(chunk)
                 logger.info(f"Discord {message.author.id}: {message.content[:50]} -> OK")
             except Exception as e:
                 logger.error(f"Failed to handle Discord message from {message.author.id}: {e}", exc_info=True)
@@ -70,12 +99,15 @@ class DiscordAdapter:
 
         async def _send_all():
             success_count = 0
+            text_md = _html_to_discord(text)
+            chunks = _chunk_text(text_md)
             for channel_id in self._known_channel_ids:
                 try:
                     channel = self.client.get_channel(channel_id)
                     if channel is None:
                         channel = await self.client.fetch_channel(channel_id)
-                    await channel.send(text)
+                    for chunk in chunks:
+                        await channel.send(chunk)
                     success_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to notify Discord channel {channel_id}: {e}")

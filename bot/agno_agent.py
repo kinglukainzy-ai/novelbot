@@ -68,10 +68,32 @@ def _build_tools(brain):
         """Get quick counts of the library by type and status."""
         return brain.handle("/stats")
 
+    def set_progress(item_id: int, current: int, total: int = 0) -> str:
+        """Set chapter/episode progress for an item. total is optional."""
+        total_part = f" {total}" if total else ""
+        return brain.handle(f"/progress {item_id} {current}{total_part}")
+
+    def set_note(item_id: int, text: str) -> str:
+        """Add or update notes on an item without changing its rating."""
+        return brain.handle(f"/note {item_id} {text}")
+
+    def find_items(query: str) -> str:
+        """Search the library by title (case-insensitive)."""
+        return brain.handle(f"/find {query}")
+
+    def get_recent(days: int = 7) -> str:
+        """Show items that received updates (new chapters/episodes) in the last N days."""
+        return brain.handle(f"/recent {days}")
+
+    def get_broken() -> str:
+        """List items whose scrapers are currently broken."""
+        return brain.handle("/broken")
+
     return [
         add_novel, add_anime, list_library, set_status,
         rate_item, add_tag, remove_item, check_for_updates,
-        get_history, get_stats,
+        get_history, get_stats, set_progress, set_note,
+        find_items, get_recent, get_broken,
     ]
 
 

@@ -10,22 +10,27 @@ from bot import anilist
 VALID_STATUSES = ["reading", "watching", "on_hold", "completed", "dropped"]
 
 HELP_TEXT = """\
-*Commands*
-/add novel <title> | <url> | [css selector]   - track a novel (selector optional but recommended)
-/add anime <title>                            - search & track an anime via AniList
-/list [novel|anime] [status]                  - show your library
-/status <id> <status>                         - reading/watching/on_hold/completed/dropped
-/rate <id> <score> [notes]                    - rate 0-10 with optional notes
-/tag <id> <tag>                               - add a tag
-/remove <id>                                  - stop tracking
-/check                                          - force a check right now
-/history                                        - recent updates log
-/stats                                          - quick counts
-/health                                         - system health status
-/ask <anything>                                 - natural language mode (needs GROQ_API_KEY, see README)
-/help                                           - this message
+<b>Commands</b>
+/add novel &lt;title&gt; | &lt;url&gt; | [css selector] — track a novel
+/add anime &lt;title&gt; — search &amp; track via AniList
+/list [novel|anime] [status] — show your library
+/find &lt;query&gt; — search titles
+/status &lt;id&gt; &lt;status&gt; — reading/watching/on_hold/completed/dropped
+/progress &lt;id&gt; &lt;current&gt; [total] — set chapter/episode progress
+/rate &lt;id&gt; &lt;score&gt; [notes] — rate 0-10 with optional notes
+/note &lt;id&gt; &lt;text&gt; — add/update notes without rating
+/tag &lt;id&gt; &lt;tag&gt; — add a tag
+/remove &lt;id&gt; — stop tracking
+/check — force an update check now
+/recent [days] — items updated recently (default 7d)
+/broken — list items with broken scrapers
+/history — recent event log
+/stats — quick counts
+/health — system health status
+/ask &lt;anything&gt; — natural language (needs GROQ_API_KEY)
+/help — this message
 
-Tip: items use | as a separator for /add novel, e.g.
+Tip: use | as separator for /add novel, e.g.
 /add novel Omniscient Reader | https://example.com/orv | div.latest-chapter
 """
 
@@ -53,11 +58,16 @@ class Brain:
             "help": self._cmd_help,
             "add": self._cmd_add,
             "list": self._cmd_list,
+            "find": self._cmd_find,
             "status": self._cmd_status,
+            "progress": self._cmd_progress,
             "rate": self._cmd_rate,
+            "note": self._cmd_note,
             "tag": self._cmd_tag,
             "remove": self._cmd_remove,
             "check": self._cmd_check,
+            "recent": self._cmd_recent,
+            "broken": self._cmd_broken,
             "history": self._cmd_history,
             "stats": self._cmd_stats,
             "health": self._cmd_health,
@@ -82,7 +92,7 @@ class Brain:
         if sub == "novel":
             parts = [p.strip() for p in rest.split("|")]
             if len(parts) < 2:
-                return "Format: /add novel <title> | <url> | [css selector]"
+                return "Format: /add novel &lt;title&gt; | &lt;url&gt; | [css selector]"
             title, url = parts[0], parts[1]
             selector = parts[2] if len(parts) > 2 and parts[2] else None
             existing = self.db.find_by_url(url)
@@ -101,7 +111,7 @@ class Brain:
 
         elif sub == "anime":
             if not rest.strip():
-                return "Format: /add anime <title>"
+                return "Format: /add anime &lt;title&gt;"
             results = anilist.search_anime(rest.strip())
             if not results:
                 return f"No anime found matching '{rest.strip()}'"
@@ -115,29 +125,72 @@ class Brain:
         else:
             return "Use: /add novel ... or /add anime ..."
 
+    @staticmethod
+    def _format_item_card(it):
+        """Build a mini-card string for a single library item (HTML formatted)."""
+        icon = "📖" if it["type"] == "novel" else "📺"
+        broken = " ⚠️" if it.get("broken") else ""
+        title = it["title"]
+        header = f"{icon} #{it['id']} — <b>{title}</b>{broken}"
+
+        details = [f"Status: {it['status']}"]
+        if it.get("progress_current"):
+            prog = str(it["progress_current"])
+            if it.get("progress_total"):
+                prog += f"/{it['progress_total']}"
+            details.append(f"Progress: {prog}")
+        if it.get("rating"):
+            details.append(f"Rating: {it['rating']}/10")
+        if it.get("last_snapshot"):
+            details.append(f"Latest: {it['last_snapshot']}")
+
+        return header + "\n" + "  |  ".join(details)
+
+    PAGE_SIZE = 10
+
     def _cmd_list(self, rest):
         args = rest.split()
         type_ = None
         status = None
+        page = 1
         for a in args:
             if a.lower() in ("novel", "anime"):
                 type_ = a.lower()
             elif a.lower() in VALID_STATUSES:
                 status = a.lower()
+            else:
+                try:
+                    page = max(1, int(a))
+                except ValueError:
+                    pass
         items = self.db.list_items(type_=type_, status=status)
         if not items:
             return "Nothing here yet. Use /add novel or /add anime to start."
-        lines = []
-        for it in items:
-            flag = " WARNING:BROKEN" if it.get("broken") else ""
-            rating = f" ({it['rating']}/10)" if it.get("rating") else ""
-            lines.append(f"#{it['id']} [{it['type']}] {it['title']} - {it['status']}{rating}{flag}")
-        return "\n".join(lines)
+
+        total = len(items)
+        total_pages = (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        page = min(page, total_pages)
+        start = (page - 1) * self.PAGE_SIZE
+        page_items = items[start : start + self.PAGE_SIZE]
+
+        cards = [self._format_item_card(it) for it in page_items]
+        result = "\n\n".join(cards)
+
+        if total_pages > 1:
+            # Rebuild the filter part so the footer hint is copy-pasteable
+            filter_parts = " ".join(p for p in [type_, status] if p)
+            next_hint = f"/list {filter_parts} {page + 1}".strip() if page < total_pages else None
+            footer = f"\n\n— Page {page}/{total_pages} ({total} items)"
+            if next_hint:
+                footer += f"  →  send {next_hint}"
+            result += footer
+
+        return result
 
     def _cmd_status(self, rest):
         parts = rest.split()
         if len(parts) < 2:
-            return f"Format: /status <id> <{'|'.join(VALID_STATUSES)}>"
+            return f"Format: /status &lt;id&gt; &lt;{'|'.join(VALID_STATUSES)}&gt;"
         try:
             item_id = int(parts[0])
         except ValueError:
@@ -155,7 +208,7 @@ class Brain:
     def _cmd_rate(self, rest):
         parts = rest.split(" ", 2)
         if len(parts) < 2:
-            return "Format: /rate <id> <score 0-10> [notes]"
+            return "Format: /rate &lt;id&gt; &lt;score 0-10&gt; [notes]"
         try:
             item_id = int(parts[0])
             score = float(parts[1])
@@ -171,7 +224,7 @@ class Brain:
     def _cmd_tag(self, rest):
         parts = rest.split(" ", 1)
         if len(parts) < 2:
-            return "Format: /tag <id> <tag>"
+            return "Format: /tag &lt;id&gt; &lt;tag&gt;"
         try:
             item_id = int(parts[0])
         except ValueError:
@@ -191,7 +244,7 @@ class Brain:
         try:
             item_id = int(rest.strip())
         except ValueError:
-            return "Format: /remove <id>"
+            return "Format: /remove &lt;id&gt;"
         item = self.db.get_item(item_id)
         if not item:
             return f"No item #{item_id}"
@@ -239,9 +292,76 @@ class Brain:
         except Exception as e:
             return f"✗ Health check failed: {e}"
 
+    def _cmd_progress(self, rest):
+        parts = rest.split()
+        if len(parts) < 2:
+            return "Format: /progress &lt;id&gt; &lt;current&gt; [total]"
+        try:
+            item_id = int(parts[0])
+            current = int(parts[1])
+        except ValueError:
+            return "ID and progress must be numbers."
+        total = None
+        if len(parts) > 2:
+            try:
+                total = int(parts[2])
+            except ValueError:
+                return "Total must be a number."
+        item = self.db.get_item(item_id)
+        if not item:
+            return f"No item #{item_id}"
+        fields = {"progress_current": current}
+        if total is not None:
+            fields["progress_total"] = total
+        self.db.update_item(item_id, **fields)
+        prog = f"{current}/{total}" if total else str(current)
+        return f"#{item_id} {item['title']} progress → {prog}"
+
+    def _cmd_note(self, rest):
+        parts = rest.split(" ", 1)
+        if len(parts) < 2:
+            return "Format: /note &lt;id&gt; &lt;text&gt;"
+        try:
+            item_id = int(parts[0])
+        except ValueError:
+            return "ID must be a number."
+        item = self.db.get_item(item_id)
+        if not item:
+            return f"No item #{item_id}"
+        self.db.update_item(item_id, notes=parts[1].strip())
+        return f"Notes updated for #{item_id} {item['title']}"
+
+    def _cmd_find(self, rest):
+        query = rest.strip()
+        if not query:
+            return "Format: /find &lt;query&gt;"
+        items = self.db.search_items(query)
+        if not items:
+            return f"No items matching '{query}'"
+        cards = [self._format_item_card(it) for it in items]
+        return "\n\n".join(cards)
+
+    def _cmd_recent(self, rest):
+        try:
+            days = int(rest.strip()) if rest.strip() else 7
+        except ValueError:
+            days = 7
+        items = self.db.recently_updated_items(days=days)
+        if not items:
+            return f"No updates in the last {days} day(s)."
+        cards = [self._format_item_card(it) for it in items]
+        return f"<b>Updated in the last {days} day(s):</b>\n\n" + "\n\n".join(cards)
+
+    def _cmd_broken(self, _):
+        items = self.db.broken_items()
+        if not items:
+            return "No broken items — everything is healthy! ✓"
+        cards = [self._format_item_card(it) for it in items]
+        return f"<b>⚠️ Broken items ({len(items)}):</b>\n\n" + "\n\n".join(cards)
+
     def _cmd_ask(self, rest):
         if not rest.strip():
-            return "Format: /ask <whatever you want to say>"
+            return "Format: /ask &lt;whatever you want to say&gt;"
         from bot import agno_agent  # lazy import - only needed if /ask is used
         return agno_agent.ask(self, rest)
 
@@ -267,19 +387,46 @@ class Brain:
         return messages
 
     def _check_novel(self, item):
+        snap = None
+        selector_failed = False
+
+        # Primary scrape attempt (with selector if set).
         try:
             snap = fetch_snapshot(item["url"], item.get("selector"))
-        except ScrapeError as e:
+        except ScrapeError:
+            selector_failed = True
+
+        # Fallback: if the selector broke, retry without it. Selectors go
+        # stale on site redesigns but the URL itself is usually still good.
+        if selector_failed and item.get("selector"):
+            try:
+                snap = fetch_snapshot(item["url"], None)
+            except ScrapeError:
+                pass  # genuine failure, handled below
+
+        # Still no snapshot — mark or stay broken.
+        if snap is None:
             if not item.get("broken"):
                 self.db.update_item(item["id"], broken=1)
-                self.db.log_event(item["id"], "scraper_broken", str(e))
-                msg = f"WARNING: Tracking broke for novel #{item['id']} {item['title']}: {e}"
+                self.db.log_event(item["id"], "scraper_broken", "scrape failed")
+                msg = f"⚠️ Tracking broke for novel #{item['id']} {item['title']}"
                 self._notify(msg)
                 return msg
             return None  # already known broken, don't spam
 
+        # If we got here with a broken item, it healed itself.
         if item.get("broken"):
             self.db.update_item(item["id"], broken=0)
+            self.db.log_event(item["id"], "scraper_recovered", "auto-healed")
+            recovery_msg = f"✅ #{item['id']} {item['title']} is back! Scraper recovered."
+            self._notify(recovery_msg)
+
+            # If the selector was the problem, clear it so future checks
+            # don't keep failing and falling back every cycle.
+            if selector_failed:
+                self.db.update_item(item["id"], selector=None)
+                self.db.log_event(item["id"], "selector_cleared",
+                                  "old selector stopped working, cleared")
 
         if snap != item.get("last_snapshot"):
             self.db.update_item(item["id"], last_snapshot=snap)
