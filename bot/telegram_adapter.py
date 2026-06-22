@@ -54,4 +54,11 @@ class TelegramAdapter:
 
     def run_polling(self):
         logger.info("Starting Telegram polling...")
+        import asyncio
+        # run_polling() calls asyncio.get_event_loop() internally, which only
+        # auto-creates a loop on the main thread (Python 3.10+ behavior).
+        # Since this runs in a background thread, we must create and set one
+        # explicitly before calling run_polling().
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         self.app.run_polling()
