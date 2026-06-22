@@ -62,9 +62,9 @@ echo "==> Installing dependencies..."
 echo "==> Setting up .env..."
 if [ ! -f ".env" ]; then
     cp .env.example .env
-    echo "    Created .env from .env.example - YOU MUST EDIT THIS before starting the bot."
+    echo "    Created .env from .env.example."
 else
-    echo "    .env already exists, leaving it untouched."
+    echo "    .env already exists - leaving existing values untouched, will only fill blanks."
 fi
 
 # Generate a random WhatsApp verify token if the placeholder is still in place,
@@ -72,7 +72,78 @@ fi
 if grep -q '^WHATSAPP_VERIFY_TOKEN=changeme123$' .env 2>/dev/null; then
     NEW_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
     sed -i "s/^WHATSAPP_VERIFY_TOKEN=changeme123$/WHATSAPP_VERIFY_TOKEN=${NEW_TOKEN}/" .env
-    echo "    Replaced default WHATSAPP_VERIFY_TOKEN with a random value."
+fi
+
+# --- helpers for interactive prompting -------------------------------------
+get_env_val() {
+    grep "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+set_env_val() {
+    local key="$1" val="$2"
+    # escape sed special chars in the value
+    local esc_val
+    esc_val=$(printf '%s\n' "$val" | sed -e 's/[\/&]/\\&/g')
+    if grep -q "^${key}=" .env 2>/dev/null; then
+        sed -i "s/^${key}=.*/${key}=${esc_val}/" .env
+    else
+        echo "${key}=${val}" >> .env
+    fi
+}
+
+prompt_if_blank() {
+    # prompt_if_blank KEY "Prompt text" "help text (optional, printed above prompt)"
+    local key="$1" prompt="$2" help="${3:-}"
+    local current
+    current="$(get_env_val "$key")"
+    if [ -n "$current" ]; then
+        echo "    $key already set, skipping."
+        return
+    fi
+    [ -n "$help" ] && echo "    $help"
+    read -rp "    $prompt: " value
+    if [ -n "$value" ]; then
+        set_env_val "$key" "$value"
+    fi
+}
+
+# --- interactive key collection ---------------------------------------------
+if [ -t 0 ]; then
+    echo ""
+    echo "==> Interactive setup - paste your keys now, or press Enter to skip a"
+    echo "    platform/key and fill it in later by editing .env yourself."
+    echo ""
+
+    read -rp "Set up Telegram now? [y/N]: " do_telegram
+    if [[ "$do_telegram" =~ ^[Yy]$ ]]; then
+        prompt_if_blank "TELEGRAM_BOT_TOKEN" "Telegram bot token (from @BotFather)"
+        prompt_if_blank "ALLOWED_TELEGRAM_IDS" "Your Telegram numeric ID (from @userinfobot)"
+    fi
+
+    echo ""
+    read -rp "Set up Discord now? [y/N]: " do_discord
+    if [[ "$do_discord" =~ ^[Yy]$ ]]; then
+        prompt_if_blank "DISCORD_BOT_TOKEN" "Discord bot token (Developer Portal > Bot tab)"
+        prompt_if_blank "ALLOWED_DISCORD_IDS" "Your Discord numeric user ID"
+    fi
+
+    echo ""
+    read -rp "Set up WhatsApp now? [y/N]: " do_whatsapp
+    if [[ "$do_whatsapp" =~ ^[Yy]$ ]]; then
+        prompt_if_blank "WHATSAPP_TOKEN" "WhatsApp access token (Meta App Dashboard > API Setup)"
+        prompt_if_blank "WHATSAPP_PHONE_NUMBER_ID" "WhatsApp Phone Number ID (same API Setup tab)"
+        prompt_if_blank "WHATSAPP_APP_SECRET" "WhatsApp App Secret (App Settings > Basic) - optional, Enter to skip"
+        prompt_if_blank "ALLOWED_WHATSAPP_NUMBERS" "Your WhatsApp number, country code no + (e.g. 15551234567)"
+    fi
+
+    echo ""
+    read -rp "Set up the optional Groq key for /ask now? [y/N]: " do_groq
+    if [[ "$do_groq" =~ ^[Yy]$ ]]; then
+        prompt_if_blank "GROQ_API_KEY" "Groq API key (console.groq.com/keys) - Enter to skip"
+    fi
+    echo ""
+else
+    echo "    (non-interactive shell detected - skipping prompts, edit .env manually)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -175,7 +246,7 @@ if [ -f "check_setup.py" ]; then
 fi
 
 echo "Next steps:"
-echo "  1. Edit .env with your API keys/tokens:"
+echo "  1. If you skipped any keys above, fill them in now:"
 echo "       nano .env"
 echo "  2. (Optional) Import your NovelFire reading history:"
 echo "       .venv/bin/python seed_library.py"
