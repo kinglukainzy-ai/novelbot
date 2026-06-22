@@ -4,9 +4,30 @@ Only listens to messages from IDs in ALLOWED_TELEGRAM_IDS.
 """
 import logging
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 logger = logging.getLogger("telegram_adapter")
+
+TELEGRAM_MAX_LEN = 4096
+
+
+def _chunk_text(text: str, max_len: int = TELEGRAM_MAX_LEN):
+    """Split text into <= max_len chunks, breaking on newlines where possible
+    so list-style output doesn't get cut mid-line."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
 
 
 class TelegramAdapter:
@@ -24,6 +45,16 @@ class TelegramAdapter:
             return True
         return user_id in self.allowed_ids
 
+    async def _reply_safe(self, message, text: str):
+        """Send a reply, chunked for length, falling back to plain text if
+        Markdown parsing fails (e.g. unescaped _ * ` [ in titles/content)."""
+        for chunk in _chunk_text(text):
+            try:
+                await message.reply_text(chunk, parse_mode="Markdown")
+            except BadRequest as e:
+                logger.warning(f"Markdown parse failed ({e}), retrying as plain text")
+                await message.reply_text(chunk)
+
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         chat_id = update.effective_chat.id
@@ -38,7 +69,7 @@ class TelegramAdapter:
             reply = self.brain.handle(update.message.text)
             if not reply:
                 reply = "(No response generated - this is a bug)"
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            await self._reply_safe(update.message, reply)
             logger.info(f"Telegram {user.id}: {update.message.text[:50]} -> OK")
         except Exception as e:
             logger.error(f"Failed to handle Telegram message from {user.id}: {e}", exc_info=True)
@@ -58,11 +89,21 @@ class TelegramAdapter:
         async def _send_all():
             success_count = 0
             for chat_id in self._known_chat_ids:
-                try:
-                    await self.app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                for chunk in _chunk_text(text):
+                    try:
+                        await self.app.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+                    except BadRequest as e:
+                        logger.warning(f"Markdown parse failed for chat {chat_id} ({e}), retrying as plain text")
+                        try:
+                            await self.app.bot.send_message(chat_id=chat_id, text=chunk)
+                        except Exception as e2:
+                            logger.warning(f"Failed to notify Telegram chat {chat_id}: {e2}")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Failed to notify Telegram chat {chat_id}: {e}")
+                        break
+                else:
                     success_count += 1
-                except Exception as e:
-                    logger.warning(f"Failed to notify Telegram chat {chat_id}: {e}")
             logger.info(f"Sent notification to {success_count}/{len(self._known_chat_ids)} Telegram chats")
 
         if self._known_chat_ids:
