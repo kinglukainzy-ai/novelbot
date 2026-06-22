@@ -76,7 +76,7 @@ class Storage:
 
     @staticmethod
     def _now():
-        return datetime.datetime.utcnow().isoformat()
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     # ---------- items ----------
 
@@ -230,7 +230,7 @@ class Storage:
 
     def recently_updated_items(self, days=7):
         """Items that had an update event (new_chapter/new_episode) in the last N days."""
-        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
         with self._conn() as c:
             rows = c.execute(
                 """SELECT DISTINCT items.* FROM items
