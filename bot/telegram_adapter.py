@@ -61,4 +61,8 @@ class TelegramAdapter:
         # explicitly before calling run_polling().
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        self.app.run_polling()
+        # stop_signals=None: registering OS signal handlers (SIGINT/SIGTERM)
+        # only works in the main thread of the main interpreter. This adapter
+        # runs in a background thread, so we disable that and let main.py's
+        # main thread handle shutdown instead.
+        self.app.run_polling(stop_signals=None)
