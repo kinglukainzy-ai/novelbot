@@ -11,7 +11,8 @@ VALID_STATUSES = ["reading", "watching", "on_hold", "completed", "dropped"]
 
 HELP_TEXT = """\
 <b>Commands</b>
-/add novel &lt;title&gt; | &lt;url&gt; | [css selector] — track a novel
+/add novel &lt;title&gt; — auto-find &amp; track via NovelFire
+/add novel &lt;title&gt; | &lt;url&gt; | [css selector] — track a novel from any site
 /add anime &lt;title&gt; — search &amp; track via AniList
 /list [novel|anime] [status] — show your library
 /find &lt;query&gt; — search titles
@@ -30,7 +31,10 @@ HELP_TEXT = """\
 /ask &lt;anything&gt; — natural language (needs GROQ_API_KEY)
 /help — this message
 
-Tip: use | as separator for /add novel, e.g.
+Tip: just a title finds it on NovelFire automatically:
+/add novel Omniscient Reader's Viewpoint
+
+Or pin an exact source with | as separator, e.g.
 /add novel Omniscient Reader | https://example.com/orv | div.latest-chapter
 """
 
@@ -91,23 +95,58 @@ class Brain:
         sub = sub.lower()
         if sub == "novel":
             parts = [p.strip() for p in rest.split("|")]
-            if len(parts) < 2:
-                return "Format: /add novel &lt;title&gt; | &lt;url&gt; | [css selector]"
-            title, url = parts[0], parts[1]
-            selector = parts[2] if len(parts) > 2 and parts[2] else None
-            existing = self.db.find_by_url(url)
-            if existing:
-                return f"That URL is already tracked as #{existing['id']}: {existing['title']}"
-            try:
-                snap = fetch_snapshot(url, selector)
-            except ScrapeError as e:
+            title = parts[0]
+            if not title:
+                return ("Format: /add novel &lt;title&gt; | &lt;url&gt; | [css selector]\n"
+                         "Or just: /add novel &lt;title&gt; to auto-find it on NovelFire")
+
+            has_url = len(parts) >= 2 and parts[1]
+            if has_url:
+                # ---- manual mode: title | url | [selector], any site ----
+                url = parts[1]
+                selector = parts[2] if len(parts) > 2 and parts[2] else None
+                existing = self.db.find_by_url(url)
+                if existing:
+                    return f"That URL is already tracked as #{existing['id']}: {existing['title']}"
+                # Add first, then verify - a failed verification still means
+                # the item should exist (marked broken), not silently vanish.
+                item_id = self.db.add_item("novel", title, url=url, selector=selector)
+                try:
+                    snap = fetch_snapshot(url, selector)
+                except ScrapeError as e:
+                    self.db.update_item(item_id, broken=1)
+                    self.db.log_event(item_id, "scraper_broken", str(e))
+                    return (
+                        f"Tracking novel #{item_id}: {title}, but I couldn't verify it "
+                        f"right away: {e}\n"
+                        "It's marked broken until fixed - /broken to see it, /remove to drop it."
+                    )
+                self.db.update_item(item_id, last_snapshot=snap, broken=0)
+                return f"Tracking novel #{item_id}: {title}\nCurrent latest: {snap}"
+
+            # ---- name-only mode: look it up on NovelFire, like /add anime ----
+            from bot import novelfire
+            results = novelfire.search_novel(title)
+            if not results:
                 return (
-                    f"Added, but I couldn't verify it right away: {e}\n"
-                    "It'll be marked broken until fixed."
+                    f"Couldn't find '{title}' on NovelFire.\n"
+                    "Add it manually instead: /add novel &lt;title&gt; | &lt;url&gt; | [css selector]"
                 )
-            item_id = self.db.add_item("novel", title, url=url, selector=selector)
-            self.db.update_item(item_id, last_snapshot=snap, broken=0)
-            return f"Tracking novel #{item_id}: {title}\nCurrent latest: {snap}"
+            top = results[0]
+            existing = self.db.find_by_url(top["url"]) or self.db.find_by_title(top["title"])
+            if existing:
+                return f"That's already tracked as #{existing['id']}: {existing['title']}"
+
+            item_id = self.db.add_item("novel", top["title"], url=top["url"])
+            snap = novelfire.latest_chapter_snapshot(top["url"])
+            self.db.update_item(item_id, last_snapshot=snap, broken=0 if snap else 1)
+
+            others = ", ".join(r["title"] for r in results[1:4] if r["url"] != top["url"])
+            extra = f"\n(Other matches if this is wrong: {others})" if others else ""
+            status_line = f"Current latest: {snap}" if snap else (
+                "Added, but couldn't verify the latest chapter yet - it'll retry on the next check."
+            )
+            return f"Tracking novel #{item_id}: {top['title']} (found on NovelFire)\n{status_line}{extra}"
 
         elif sub == "anime":
             if not rest.strip():

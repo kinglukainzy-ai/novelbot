@@ -23,10 +23,13 @@ _agent_cache = {}
 
 
 def _build_tools(brain):
-    def add_novel(title: str, url: str, selector: str = "") -> str:
-        """Track a new novel by title and source URL. selector is an
-        optional CSS selector pointing at the latest-chapter element on
-        the page, which makes update detection much more reliable."""
+    def add_novel(title: str, url: str = "", selector: str = "") -> str:
+        """Track a new novel by title. If url is omitted, looks it up
+        automatically on NovelFire (works for most popular web novels - try
+        this first). Only pass url (and optionally selector) when the user
+        gives a specific link, or NovelFire doesn't have it."""
+        if not url:
+            return brain.handle(f"/add novel {title}")
         sel_part = f" | {selector}" if selector else ""
         return brain.handle(f"/add novel {title} | {url}{sel_part}")
 
