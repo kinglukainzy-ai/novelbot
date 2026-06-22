@@ -36,11 +36,24 @@ class DiscordAdapter:
             if message.author.id == self.client.user.id:
                 return
             if not self._is_allowed(message.author.id):
-                await message.channel.send("Not authorized.")
+                try:
+                    await message.channel.send("Not authorized.")
+                except Exception as e:
+                    logger.error(f"Failed to send 'not authorized' message: {e}")
                 return
             self._known_channel_ids.add(message.channel.id)
-            reply = self.brain.handle(message.content)
-            await message.channel.send(reply)
+            try:
+                reply = self.brain.handle(message.content)
+                if not reply:
+                    reply = "(No response generated - this is a bug)"
+                await message.channel.send(reply)
+                logger.info(f"Discord {message.author.id}: {message.content[:50]} -> OK")
+            except Exception as e:
+                logger.error(f"Failed to handle Discord message from {message.author.id}: {e}", exc_info=True)
+                try:
+                    await message.channel.send(f"Error: {e}")
+                except Exception as e2:
+                    logger.error(f"Failed to send error message: {e2}")
 
     def _is_allowed(self, user_id: int) -> bool:
         if not self.allowed_ids:
@@ -56,14 +69,17 @@ class DiscordAdapter:
         import asyncio
 
         async def _send_all():
+            success_count = 0
             for channel_id in self._known_channel_ids:
                 try:
                     channel = self.client.get_channel(channel_id)
                     if channel is None:
                         channel = await self.client.fetch_channel(channel_id)
                     await channel.send(text)
+                    success_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to notify Discord channel {channel_id}: {e}")
+            logger.info(f"Sent notification to {success_count}/{len(self._known_channel_ids)} Discord channels")
 
         if not self._known_channel_ids:
             return
@@ -77,4 +93,9 @@ class DiscordAdapter:
 
     def run(self):
         logger.info("Starting Discord client...")
-        self.client.run(self.token, log_handler=None)
+        try:
+            self.client.run(self.token, log_handler=None)
+        except Exception as e:
+            logger.error(f"Discord client failed: {e}", exc_info=True)
+        finally:
+            logger.info("Discord client stopped")

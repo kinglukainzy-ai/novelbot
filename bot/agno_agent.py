@@ -115,6 +115,7 @@ def ask(brain, text: str) -> str:
         )
     try:
         response = agent.run(text)
-        return response.content or "(no response)"
+        content = response.get_content_as_string()
+        return content or "(no response)"
     except Exception as e:
         return f"Natural-language request failed: {e}"

@@ -21,6 +21,7 @@ HELP_TEXT = """\
 /check                                          - force a check right now
 /history                                        - recent updates log
 /stats                                          - quick counts
+/health                                         - system health status
 /ask <anything>                                 - natural language mode (needs GROQ_API_KEY, see README)
 /help                                           - this message
 
@@ -59,6 +60,7 @@ class Brain:
             "check": self._cmd_check,
             "history": self._cmd_history,
             "stats": self._cmd_stats,
+            "health": self._cmd_health,
             "ask": self._cmd_ask,
         }
         fn = handlers.get(cmd)
@@ -83,6 +85,9 @@ class Brain:
                 return "Format: /add novel <title> | <url> | [css selector]"
             title, url = parts[0], parts[1]
             selector = parts[2] if len(parts) > 2 and parts[2] else None
+            existing = self.db.find_by_url(url)
+            if existing:
+                return f"That URL is already tracked as #{existing['id']}: {existing['title']}"
             try:
                 snap = fetch_snapshot(url, selector)
             except ScrapeError as e:
@@ -216,6 +221,24 @@ class Brain:
             lines.append(f"  {k}: {v}")
         return "\n".join(lines)
 
+    def _cmd_health(self, _):
+        """Check system health - database connectivity, basic stats, etc."""
+        try:
+            s = self.db.stats()
+            status = "✓ Healthy"
+            db_status = "✓ Database OK"
+            items_count = s['total']
+            lines = [
+                status,
+                db_status,
+                f"Items tracked: {items_count}",
+                f"Novels: {s['by_type'].get('novel', 0)}",
+                f"Anime: {s['by_type'].get('anime', 0)}",
+            ]
+            return "\n".join(lines)
+        except Exception as e:
+            return f"✗ Health check failed: {e}"
+
     def _cmd_ask(self, rest):
         if not rest.strip():
             return "Format: /ask <whatever you want to say>"
@@ -267,6 +290,8 @@ class Brain:
         return None
 
     def _check_anime(self, item):
+        if not item.get("anilist_id"):
+            return None  # no AniList ID - skip to avoid bad API requests
         state = anilist.get_anime_state(item["anilist_id"])
         if state["snapshot"] != item.get("last_snapshot"):
             self.db.update_item(item["id"], last_snapshot=state["snapshot"])

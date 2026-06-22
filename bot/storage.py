@@ -89,6 +89,14 @@ class Storage:
             ).fetchone()
             return dict(row) if row else None
 
+    def find_by_url(self, url):
+        """Find an existing item by URL - used for duplicate detection on /add novel."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM items WHERE url=?", (url,)
+            ).fetchone()
+            return dict(row) if row else None
+
     def upsert_seed_item(self, type_, title, url=None, status="reading",
                           progress_current=None, progress_total=None,
                           last_chapter_title=None, last_read_at=None):

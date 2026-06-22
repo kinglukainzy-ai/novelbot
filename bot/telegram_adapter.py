@@ -28,11 +28,24 @@ class TelegramAdapter:
         user = update.effective_user
         chat_id = update.effective_chat.id
         if not self._is_allowed(user.id):
-            await update.message.reply_text("Not authorized.")
+            try:
+                await update.message.reply_text("Not authorized.")
+            except Exception as e:
+                logger.error(f"Failed to send 'not authorized' message to {user.id}: {e}")
             return
         self._known_chat_ids.add(chat_id)
-        reply = self.brain.handle(update.message.text)
-        await update.message.reply_text(reply)
+        try:
+            reply = self.brain.handle(update.message.text)
+            if not reply:
+                reply = "(No response generated - this is a bug)"
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            logger.info(f"Telegram {user.id}: {update.message.text[:50]} -> OK")
+        except Exception as e:
+            logger.error(f"Failed to handle Telegram message from {user.id}: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"Error: {e}")
+            except Exception as e2:
+                logger.error(f"Failed to send error message to {user.id}: {e2}")
 
     def send_to_all_known(self, text: str):
         """
@@ -43,11 +56,14 @@ class TelegramAdapter:
         import asyncio
 
         async def _send_all():
+            success_count = 0
             for chat_id in self._known_chat_ids:
                 try:
-                    await self.app.bot.send_message(chat_id=chat_id, text=text)
+                    await self.app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+                    success_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to notify Telegram chat {chat_id}: {e}")
+            logger.info(f"Sent notification to {success_count}/{len(self._known_chat_ids)} Telegram chats")
 
         if self._known_chat_ids:
             asyncio.run(_send_all())
@@ -65,4 +81,9 @@ class TelegramAdapter:
         # only works in the main thread of the main interpreter. This adapter
         # runs in a background thread, so we disable that and let main.py's
         # main thread handle shutdown instead.
-        self.app.run_polling(stop_signals=None)
+        try:
+            self.app.run_polling(stop_signals=None)
+        except Exception as e:
+            logger.error(f"Telegram polling failed: {e}", exc_info=True)
+        finally:
+            logger.info("Telegram polling stopped")

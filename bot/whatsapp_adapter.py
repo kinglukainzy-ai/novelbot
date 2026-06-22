@@ -85,8 +85,15 @@ class WhatsAppAdapter:
                 return "ok", 200
 
             self._known_numbers.add(from_number)
-            reply = self.brain.handle(text)
-            self._send(from_number, reply)
+            try:
+                reply = self.brain.handle(text)
+                if not reply:
+                    reply = "(No response generated - this is a bug)"
+                self._send(from_number, reply)
+                logger.info(f"WhatsApp {from_number}: {text[:50]} -> OK")
+            except Exception as e:
+                logger.error(f"Failed to handle WhatsApp message from {from_number}: {e}", exc_info=True)
+                self._send(from_number, f"Error: {e}")
             return "ok", 200
 
         @self.app.route("/health", methods=["GET"])
@@ -105,14 +112,28 @@ class WhatsAppAdapter:
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=15)
             if resp.status_code >= 400:
-                logger.warning(f"WhatsApp send failed: {resp.status_code} {resp.text}")
+                logger.error(f"WhatsApp send failed: {resp.status_code} {resp.text}")
+            else:
+                logger.debug(f"WhatsApp message sent to {to_number}")
         except requests.RequestException as e:
-            logger.warning(f"WhatsApp send error: {e}")
+            logger.error(f"WhatsApp send error: {e}", exc_info=True)
 
     def send_to_all_known(self, text: str):
         """Used by the scheduler to push proactive notifications."""
+        success_count = 0
         for number in self._known_numbers:
-            self._send(number, text)
+            try:
+                self._send(number, text)
+                success_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to notify WhatsApp number {number}: {e}")
+        logger.info(f"Sent notification to {success_count}/{len(self._known_numbers)} WhatsApp numbers")
 
     def run(self, host="0.0.0.0", port=8080):
-        self.app.run(host=host, port=port)
+        logger.info(f"Starting WhatsApp webhook on {host}:{port}")
+        try:
+            self.app.run(host=host, port=port)
+        except Exception as e:
+            logger.error(f"WhatsApp webhook failed: {e}", exc_info=True)
+        finally:
+            logger.info("WhatsApp webhook stopped")
