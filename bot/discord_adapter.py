@@ -12,6 +12,8 @@ Only listens to messages from IDs in ALLOWED_DISCORD_IDS.
 import logging
 import discord
 
+logger = logging.getLogger(__name__)
+
 DISCORD_MAX_LEN = 2000
 
 
