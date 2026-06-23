@@ -6,7 +6,7 @@ APScheduler==3.10.4
 python-dotenv==1.0.1
 discord.py==2.4.0
 
-# Optional - only needed if you use the /ask command (natural language mode).
-# Safe to leave installed even if you never use /ask; costs nothing unless called.
-agno==2.6.18
-groq==1.5.0
+# Optional - only needed if you use the /ask command or the scraper's AI
+# fallback. Safe to leave installed even if you never use either; costs
+# nothing unless called.
+google-genai>=1.0.0

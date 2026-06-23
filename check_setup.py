@@ -41,9 +41,10 @@ CHECKS = [
      "Your own WhatsApp number (with country code, no +), verified as a test "
      "recipient in the same API Setup tab."),
 
-    ("GROQ_API_KEY", "/ask natural-language command (optional)",
-     "https://console.groq.com/keys - free tier, no card required. "
-     "Leave blank to disable /ask; every other command still works for free."),
+    ("GEMINI_API_KEY", "/ask natural-language command + scraper AI fallback (optional)",
+     "https://aistudio.google.com/apikey - free tier, no card required. "
+     "Leave blank to disable /ask and the AI scraper fallback; every other "
+     "command still works for free."),
 ]
 
 PLATFORM_GROUPS = {
@@ -54,9 +55,9 @@ PLATFORM_GROUPS = {
 }
 
 # Only these are ever truly "required" - and only one platform's set is
-# needed, not all of them. Everything else (GROQ, app secret, verify token)
+# needed, not all of them. Everything else (GEMINI, app secret, verify token)
 # is optional/security-hardening.
-OPTIONAL_KEYS = {"GROQ_API_KEY", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN"}
+OPTIONAL_KEYS = {"GEMINI_API_KEY", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN"}
 
 
 def load_env():
@@ -119,7 +120,7 @@ def main():
     else:
         print("No platform is fully configured yet - the bot will refuse to start.")
         print("You only need ONE of Telegram / Discord / WhatsApp, not all three.")
-    print("GROQ_API_KEY is optional - only needed for the /ask command.")
+    print("GEMINI_API_KEY is optional - only needed for /ask and the scraper AI fallback.")
 
     if env.get("WHATSAPP_TOKEN"):
         port = env.get("WEBHOOK_PORT", "8080")

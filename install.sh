@@ -137,9 +137,9 @@ if [ -t 0 ]; then
     fi
 
     echo ""
-    read -rp "Set up the optional Groq key for /ask now? [y/N]: " do_groq
-    if [[ "$do_groq" =~ ^[Yy]$ ]]; then
-        prompt_if_blank "GROQ_API_KEY" "Groq API key (console.groq.com/keys) - Enter to skip"
+    read -rp "Set up the optional Gemini key for /ask + scraper AI fallback now? [y/N]: " do_gemini
+    if [[ "$do_gemini" =~ ^[Yy]$ ]]; then
+        prompt_if_blank "GEMINI_API_KEY" "Gemini API key (aistudio.google.com/apikey) - Enter to skip"
     fi
     echo ""
 else

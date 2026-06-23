@@ -4,7 +4,7 @@ adapters just pass raw text in here and send back whatever string comes out.
 This is what makes "one library across both apps" work.
 """
 from bot.storage import Storage
-from bot.scraper import fetch_snapshot, ScrapeError
+from bot.scraper import fetch_snapshot, fetch_snapshot_ai, ScrapeError
 from bot import anilist
 
 VALID_STATUSES = ["reading", "watching", "on_hold", "completed", "dropped"]
@@ -28,7 +28,7 @@ HELP_TEXT = """\
 /history — recent event log
 /stats — quick counts
 /health — system health status
-/ask &lt;anything&gt; — natural language (needs GROQ_API_KEY)
+/ask &lt;anything&gt; — natural language (needs GEMINI_API_KEY)
 /help — this message
 
 Tip: just a title finds it on NovelFire automatically:
@@ -114,13 +114,16 @@ class Brain:
                 try:
                     snap = fetch_snapshot(url, selector)
                 except ScrapeError as e:
-                    self.db.update_item(item_id, broken=1)
-                    self.db.log_event(item_id, "scraper_broken", str(e))
-                    return (
-                        f"Tracking novel #{item_id}: {title}, but I couldn't verify it "
-                        f"right away: {e}\n"
-                        "It's marked broken until fixed - /broken to see it, /remove to drop it."
-                    )
+                    snap = fetch_snapshot_ai(url)
+                    if snap is None:
+                        self.db.update_item(item_id, broken=1)
+                        self.db.log_event(item_id, "scraper_broken", str(e))
+                        return (
+                            f"Tracking novel #{item_id}: {title}, but I couldn't verify it "
+                            f"right away: {e}\n"
+                            "It's marked broken until fixed - /broken to see it, /remove to drop it."
+                        )
+                    self.db.log_event(item_id, "scraper_ai_fallback", "selector/heuristic failed on add, AI found a snapshot")
                 self.db.update_item(item_id, last_snapshot=snap, broken=0)
                 return f"Tracking novel #{item_id}: {title}\nCurrent latest: {snap}"
 
@@ -401,8 +404,8 @@ class Brain:
     def _cmd_ask(self, rest):
         if not rest.strip():
             return "Format: /ask &lt;whatever you want to say&gt;"
-        from bot import agno_agent  # lazy import - only needed if /ask is used
-        return agno_agent.ask(self, rest)
+        from bot import ai_agent  # lazy import - only needed if /ask is used
+        return ai_agent.ask(self, rest)
 
     # ---------------- background check cycle ----------------
 
@@ -443,6 +446,17 @@ class Brain:
             except ScrapeError:
                 pass  # genuine failure, handled below
 
+        # Last resort: both the selector and the "chapter" heuristic came up
+        # empty (e.g. full site redesign). Ask Gemini to find the latest
+        # chapter marker in the page text. Only fires when genuinely broken,
+        # and is a no-op (returns None) if GEMINI_API_KEY isn't set.
+        used_ai_fallback = False
+        if snap is None:
+            ai_snap = fetch_snapshot_ai(item["url"])
+            if ai_snap is not None:
+                snap = ai_snap
+                used_ai_fallback = True
+
         # Still no snapshot — mark or stay broken.
         if snap is None:
             if not item.get("broken"):
@@ -456,13 +470,17 @@ class Brain:
         # If we got here with a broken item, it healed itself.
         if item.get("broken"):
             self.db.update_item(item["id"], broken=0)
-            self.db.log_event(item["id"], "scraper_recovered", "auto-healed")
+            recover_detail = "AI fallback found a snapshot" if used_ai_fallback else "auto-healed"
+            self.db.log_event(item["id"], "scraper_recovered", recover_detail)
             recovery_msg = f"✅ #{item['id']} {item['title']} is back! Scraper recovered."
             self._notify(recovery_msg)
 
             # If the selector was the problem, clear it so future checks
-            # don't keep failing and falling back every cycle.
-            if selector_failed:
+            # don't keep failing and falling back every cycle. Don't clear
+            # it just because the AI fallback fired - that's a per-cycle
+            # cost, not a one-time fix, so leave the selector in place in
+            # case the next normal check works again on its own.
+            if selector_failed and not used_ai_fallback:
                 self.db.update_item(item["id"], selector=None)
                 self.db.log_event(item["id"], "selector_cleared",
                                   "old selector stopped working, cleared")

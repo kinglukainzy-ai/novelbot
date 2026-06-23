@@ -47,25 +47,34 @@ identically on all three.
 7. You'll configure the webhook URL (`https://yourdomain/webhook`) once
    the bot is running on your VM — see step 4 below
 
-## 2.5. Optional: natural language mode (/ask)
+## 2.5. Optional: natural language mode (/ask) + scraper AI fallback
 
 Every command (`/add`, `/list`, `/status`, etc.) works with **zero LLM
-involvement and zero cost** — that's the default, always-on bot.
+involvement and zero cost** — that's the default, always-on bot. The
+recurring chapter check also works with zero LLM cost in the normal case
+(CSS selector, or a "chapter" text heuristic if no selector is set).
 
-If you also want to be able to type things like *"hey, did Frieren get a
-new episode?"* instead of exact command syntax, there's one extra command,
-`/ask`, that routes through a free-tier LLM (Groq) which translates your
-sentence into the right command(s) for you. Nothing else changes — every
-other command still bypasses the LLM entirely.
+One optional API key, `GEMINI_API_KEY`, unlocks two extra features:
 
-To enable it:
-1. Get a free API key at https://console.groq.com/keys (no credit card
+1. **`/ask`** — type things like *"hey, did Frieren get a new episode?"*
+   instead of exact command syntax. Gemini just translates your sentence
+   into the right command(s); every other command still bypasses the LLM
+   entirely. It can also answer read-only questions about your library and
+   the bot itself (item details, history, stats, broken scrapers, etc).
+2. **Scraper AI fallback** — if a novel's CSS selector *and* the built-in
+   "chapter" heuristic both fail (typically after a site redesign), the bot
+   makes one Gemini call with the page's text and asks it to find the
+   latest chapter marker, before giving up and marking the item broken.
+
+To enable either:
+1. Get a free API key at https://aistudio.google.com/apikey (no credit card
    needed for the free tier, generous limits for personal use)
-2. Put it in `GROQ_API_KEY` in `.env`
+2. Put it in `GEMINI_API_KEY` in `.env`
 3. Restart the bot
 
-Leave `GROQ_API_KEY` blank if you don't want this — `/ask` will just tell
-you it's not configured, and everything else works exactly the same either way.
+Leave `GEMINI_API_KEY` blank if you don't want either feature — `/ask` will
+tell you it's not configured, and the scraper falls back to "marked broken"
+exactly as before. Everything else works the same either way.
 
 ## 3. Configure the bot
 
