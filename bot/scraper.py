@@ -122,3 +122,48 @@ def fetch_snapshot_ai(url: str) -> str | None:
     if not out or out.upper() == "NONE":
         return None
     return out[:200]
+
+
+def fetch_snapshot_websearch(title: str) -> str | None:
+    """Absolute last resort — when the page itself is unscrapeable (down,
+    geo-blocked, behind JS, fully redesigned), ask Gemini to do a live web
+    search for the novel's latest chapter by name.
+
+    This deliberately uses Gemini's web_search tool rather than reading the
+    page, so it works even when the URL is completely unreachable.
+
+    Returns None - never raises - if GEMINI_API_KEY isn't set, the search
+    finds nothing, or anything else goes wrong.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+        prompt = (
+            f"Search the web right now for the latest chapter of the web novel "
+            f"'{title}'. Reply with ONLY the chapter number and title "
+            f"(e.g. 'Chapter 412: The Final Battle'). "
+            f"If you genuinely cannot find it, reply with exactly: NONE"
+        )
+
+        result = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            ),
+        )
+        out = (result.text or "").strip()
+    except Exception:
+        return None
+
+    if not out or out.upper() == "NONE":
+        return None
+    return out[:200]

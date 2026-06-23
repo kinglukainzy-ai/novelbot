@@ -10,18 +10,30 @@ The tools below are just thin wrappers that re-assemble the exact same
 slash-command strings and hand them to brain.handle(). This means there's
 only one real implementation of the logic (in brain.py); the LLM's only
 job is figuring out which tool(s) to call from a natural-language
-sentence, including read-only questions about the library/database
-(counts, broken items, history, a specific item's details, etc).
+sentence, including read-only questions about the library/database,
+recommendations, and multi-turn conversations.
+
+CONVERSATION MEMORY
+-------------------
+Each Telegram user_id gets a short rolling history (up to HISTORY_TURNS
+turns). This means:
+  - After Gemini asks "Have you watched X?", the user can reply with just
+    "yes" or "no" and the context is preserved.
+  - "Add the first one" after a recommendation list works correctly.
+  - /ask clear  resets the conversation history for the current user.
 
 Uses Gemini's native SDK (google-genai) directly - no agent framework.
-Gemini's automatic function calling handles the "which tool, with what
-arguments" loop on its own when you pass plain Python functions as tools.
+Gemini's automatic function calling handles the tool-call loop.
 
-Free API key: https://aistudio.google.com/apikey - generous free-tier
-limits for personal use, no card required.
+Free API key: https://aistudio.google.com/apikey
 """
 import os
+import time
+from collections import deque
 
+# ---------------------------------------------------------------------------
+# Client cache
+# ---------------------------------------------------------------------------
 _client_cache = {}
 
 
@@ -37,6 +49,36 @@ def _get_client():
     return client
 
 
+# ---------------------------------------------------------------------------
+# Per-user conversation history
+# Each entry is a dict: {"role": "user"|"model", "parts": [{"text": "..."}]}
+# We keep the last HISTORY_TURNS *pairs* (user + model), so max
+# HISTORY_TURNS * 2 entries in the deque.
+# ---------------------------------------------------------------------------
+HISTORY_TURNS = 6          # how many back-and-forth exchanges to remember
+_history: dict[int, deque] = {}   # user_id -> deque of message dicts
+
+
+def _get_history(user_id: int) -> list:
+    if user_id not in _history:
+        _history[user_id] = deque(maxlen=HISTORY_TURNS * 2)
+    return list(_history[user_id])
+
+
+def _append_history(user_id: int, role: str, text: str):
+    if user_id not in _history:
+        _history[user_id] = deque(maxlen=HISTORY_TURNS * 2)
+    _history[user_id].append({"role": role, "parts": [{"text": text}]})
+
+
+def clear_history(user_id: int):
+    """Wipe the conversation history for this user (called by /ask clear)."""
+    _history.pop(user_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
 def _build_tools(brain):
     def add_novel(title: str, url: str = "", selector: str = "") -> str:
         """Track a new novel by title. If url is omitted, looks it up
@@ -152,21 +194,33 @@ def _build_tools(brain):
         return brain.handle("/health")
 
     def force_fix_scraper(item_id: int) -> str:
-        """Force an immediate retry of a broken novel's scraper (selector,
-        then the chapter heuristic, then the AI fallback as a last resort).
-        Use this when the user asks to fix/retry/unbreak a specific tracked
-        novel right now, instead of waiting for the next scheduled check."""
+        """Force the full 4-tier repair pipeline on a novel right now:
+        selector → heuristic → AI page-read → AI web search by title.
+        Use when the user asks to fix/retry/unbreak a specific novel.
+        The web search tier fires last and uses only the novel's name,
+        so it works even when the page itself is unreachable."""
         return brain.handle(f"/fix {item_id}")
+
+    def clear_broken_flag(item_id: int) -> str:
+        """Manually clear the broken flag on a novel without attempting
+        any scrape. Use when the user says something like 'just mark it
+        as fixed', 'dismiss the broken warning', or 'clear the error on #X'.
+        Warns the user that if the underlying problem isn't resolved the
+        bot will re-mark it broken on the next scheduled check."""
+        return brain.handle(f"/fix clear {item_id}")
 
     return [
         add_novel, add_anime, list_library, set_status,
         rate_item, add_tag, remove_item, check_for_updates,
         get_history, get_stats, set_progress, set_note,
         find_items, get_recent, get_broken, get_item_details,
-        get_library_data, run_health_check, force_fix_scraper,
+        get_library_data, run_health_check, force_fix_scraper, clear_broken_flag,
     ]
 
 
+# ---------------------------------------------------------------------------
+# System instruction
+# ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = (
     "You are a versatile assistant over the user's personal novel/anime "
     "tracking library and the bot that runs it. "
@@ -183,30 +237,66 @@ SYSTEM_INSTRUCTION = (
     "get_library_data to get the full library as structured data, then do "
     "the sorting/filtering/math yourself - don't say you can't answer just "
     "because there's no single tool that already does the ranking for you. "
+
     "RECOMMENDATIONS: When the user asks for book/novel/anime recommendations "
     "or what they should read/watch next, always call get_library_data first "
     "to understand their taste - look at their highest-rated items, tags, "
     "genres, and notes. Then use your own general knowledge of the web novel, "
     "light novel, manhwa, and anime space to suggest titles they are NOT "
     "already tracking that fit those patterns. Be specific: name the title, "
-    "give a one-sentence reason tied directly to something in their library "
-    "(e.g. 'you rated X highly and this has the same system/regression "
-    "themes'). Suggest 3-5 titles. If they immediately ask to add one, call "
-    "add_novel or add_anime right away without asking again. "
+    "give a one-sentence reason tied directly to something in their library. "
+    "Suggest 3-5 titles. If they immediately say 'add it' or 'add the first "
+    "one', call add_novel or add_anime right away without asking again. "
+
+    "PROACTIVE QUESTIONS: When recommending anime or novels, you may ask the "
+    "user if they have already seen/read a specific title you are about to "
+    "suggest - their yes/no answer should determine whether you add it as "
+    "'completed' (set_status after adding) or leave it as watching/reading. "
+    "Ask one question at a time, not a list. Wait for the answer before "
+    "proceeding. The conversation history is preserved between /ask messages "
+    "so the user can reply with just 'yes', 'no', or 'add it' and you will "
+    "have full context. "
+
+    "CONVERSATION FLOW: You have memory of the last several exchanges with "
+    "this user. Use it. If the user says 'yes', 'the second one', 'add that', "
+    "'never mind', etc., interpret it relative to what was just discussed. "
+    "Never ask for clarification you already have from earlier in the thread. "
+
     "If a question genuinely needs data no tool provides, say so plainly "
     "rather than guessing. "
     "Keep replies short and to the point, suitable for a chat message. "
-    "If a request is ambiguous (e.g. which item id), ask a brief "
-    "clarifying question instead of guessing."
+    "If a request is truly ambiguous and the history doesn't clarify it, "
+    "ask one brief clarifying question."
 )
 
 
-def ask(brain, text: str) -> str:
+# ---------------------------------------------------------------------------
+# Retry config
+# ---------------------------------------------------------------------------
+_RETRYABLE = ("503", "503 UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+              "UNAVAILABLE", "overloaded")
+MAX_RETRIES = 3
+BACKOFF_BASE = 2  # seconds; doubles each attempt: 2s, 4s, 8s
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def ask(brain, text: str, user_id: int = 0) -> str:
     """Entry point called by brain.py's /ask command.
 
-    Retries up to 3 times on transient server errors (503 UNAVAILABLE,
-    429 RESOURCE_EXHAUSTED) with exponential back-off before giving up.
+    user_id is the Telegram user id — used to maintain per-user conversation
+    history so multi-turn exchanges (recommendations, yes/no questions, etc.)
+    work correctly. Pass 0 if the caller doesn't have a user id (falls back
+    to a shared single-user history).
+
+    Special command: if text.strip().lower() == 'clear', wipes history and
+    returns a confirmation message without hitting the API.
     """
+    if text.strip().lower() == "clear":
+        clear_history(user_id)
+        return "Conversation history cleared. Starting fresh."
+
     client = _get_client()
     if client is None:
         return (
@@ -214,13 +304,6 @@ def ask(brain, text: str) -> str:
             "at https://aistudio.google.com/apikey and set GEMINI_API_KEY in your "
             ".env file, then restart the bot."
         )
-
-    import time
-
-    _RETRYABLE = ("503", "503 UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
-                  "UNAVAILABLE", "overloaded")
-    MAX_RETRIES = 3
-    BACKOFF_BASE = 2  # seconds; doubles each attempt: 2s, 4s, 8s
 
     from google.genai import types
 
@@ -230,28 +313,36 @@ def ask(brain, text: str) -> str:
         tools=_build_tools(brain),
     )
 
+    # Build contents = history + new user message
+    history = _get_history(user_id)
+    contents = history + [{"role": "user", "parts": [{"text": text}]}]
+
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.models.generate_content(
                 model=model,
-                contents=text,
+                contents=contents,
                 config=config,
             )
-            return response.text or "(no response)"
+            reply = response.text or "(no response)"
+
+            # Persist this turn into history
+            _append_history(user_id, "user", text)
+            _append_history(user_id, "model", reply)
+
+            return reply
+
         except Exception as e:
             last_err = e
             err_str = str(e)
             is_retryable = any(token.lower() in err_str.lower()
                                for token in _RETRYABLE)
             if is_retryable and attempt < MAX_RETRIES:
-                wait = BACKOFF_BASE ** attempt
-                time.sleep(wait)
+                time.sleep(BACKOFF_BASE ** attempt)
                 continue
-            # Non-retryable error, or exhausted retries — bail out
             break
 
-    # Friendly message depending on whether it was an overload
     err_str = str(last_err)
     if any(token.lower() in err_str.lower() for token in _RETRYABLE):
         return (

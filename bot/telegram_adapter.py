@@ -66,7 +66,7 @@ class TelegramAdapter:
             return
         self._known_chat_ids.add(chat_id)
         try:
-            reply = self.brain.handle(update.message.text)
+            reply = self.brain.handle(update.message.text, user_id=user.id)
             if not reply:
                 reply = "(No response generated - this is a bug)"
             await self._reply_safe(update.message, reply)

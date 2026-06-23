@@ -6,7 +6,7 @@ This is what makes "one library across both apps" work.
 import os
 
 from bot.storage import Storage
-from bot.scraper import fetch_snapshot, fetch_snapshot_ai, ScrapeError
+from bot.scraper import fetch_snapshot, fetch_snapshot_ai, fetch_snapshot_websearch, ScrapeError
 from bot import anilist
 
 VALID_STATUSES = ["reading", "watching", "on_hold", "completed", "dropped"]
@@ -51,7 +51,7 @@ class Brain:
 
     # ---------------- public entrypoint ----------------
 
-    def handle(self, text: str) -> str:
+    def handle(self, text: str, user_id: int = 0) -> str:
         text = text.strip()
         if not text:
             return "Send /help to see what I can do."
@@ -84,6 +84,7 @@ class Brain:
         fn = handlers.get(cmd)
         if not fn:
             return "I didn't recognize that. Send /help to see commands."
+        self._current_user_id = user_id
         try:
             return fn(rest)
         except Exception as e:
@@ -408,9 +409,38 @@ class Brain:
     def _cmd_fix(self, rest):
         rest = rest.strip()
         if not rest:
-            return "Format: /fix <id> — force-retry a broken novel's scraper right now (uses the AI fallback if needed)."
+            return (
+                "Format:\n"
+                "  /fix <id>        — run the full 4-tier repair pipeline right now\n"
+                "  /fix clear <id>  — manually clear the broken flag (no scrape attempt)"
+            )
+
+        parts = rest.split()
+
+        # ── /fix clear <id> ──────────────────────────────────────────────────
+        if parts[0].lower() == "clear":
+            if len(parts) < 2:
+                return "Format: /fix clear <id>"
+            try:
+                item_id = int(parts[1])
+            except ValueError:
+                return "Item id must be a number, e.g. /fix clear 236"
+            item = self.db.get_item(item_id)
+            if not item:
+                return f"No item with id {item_id}."
+            if not item.get("broken"):
+                return f"#{item_id} {item['title']} isn't marked broken — nothing to clear."
+            self.db.update_item(item_id, broken=0)
+            self.db.log_event(item_id, "scraper_fixed", "broken flag cleared manually via /fix clear")
+            return (
+                f"✅ Cleared broken flag for #{item_id} {item['title']}.\n"
+                "Note: no scrape was attempted — if the underlying problem isn't fixed "
+                "the bot will re-mark it broken on the next scheduled check."
+            )
+
+        # ── /fix <id> ─────────────────────────────────────────────────────────
         try:
-            item_id = int(rest.split()[0])
+            item_id = int(parts[0])
         except ValueError:
             return "Item id must be a number, e.g. /fix 236"
 
@@ -418,21 +448,23 @@ class Brain:
         if not item:
             return f"No item with id {item_id}."
         if item["type"] != "novel":
-            return f"#{item_id} {item['title']} isn't a novel - only novels have scrapers to fix."
+            return f"#{item_id} {item['title']} isn't a novel — only novels have scrapers to fix."
         if not item.get("url"):
-            return f"#{item_id} {item['title']} has no URL on file - nothing to scrape."
+            return f"#{item_id} {item['title']} has no URL on file — nothing to scrape."
 
-        # Same order as a normal check: selector -> heuristic -> AI fallback.
-        # Unlike a normal check, this runs even if the item isn't currently
-        # marked broken, and reports exactly which method worked.
+        # 4-tier pipeline, same order as a normal check cycle.
+        # Reports exactly which tier worked (or all four failed).
         snap = None
         method = None
+
+        # Tier 1: selector
         try:
             snap = fetch_snapshot(item["url"], item.get("selector"))
             method = "selector" if item.get("selector") else "heuristic"
         except ScrapeError:
             pass
 
+        # Tier 2: heuristic (no selector)
         if snap is None and item.get("selector"):
             try:
                 snap = fetch_snapshot(item["url"], None)
@@ -440,42 +472,46 @@ class Brain:
             except ScrapeError:
                 pass
 
+        # Tier 3: AI reads the page text
         if snap is None:
             snap = fetch_snapshot_ai(item["url"])
             if snap is not None:
-                method = "AI fallback"
+                method = "AI page-read"
+
+        # Tier 4: AI web search by title — page itself may be unreachable
+        if snap is None:
+            snap = fetch_snapshot_websearch(item["title"])
+            if snap is not None:
+                method = "AI web search"
 
         if snap is None:
+            hint = (
+                "Use /fix clear {id} to manually dismiss the broken flag if "
+                "you're sure the novel is fine."
+            ).format(id=item_id)
             if os.getenv("GEMINI_API_KEY"):
                 return (
-                    f"Still broken: couldn't get a snapshot for #{item_id} {item['title']} "
-                    "even with the AI fallback. The page may be down, geo-blocked, or "
-                    "behind something the scraper can't get past."
+                    f"❌ Still broken: all 4 tiers failed for #{item_id} {item['title']}.\n"
+                    "The page may be permanently down, geo-blocked, or behind a login wall.\n"
+                    + hint
                 )
             return (
-                f"Still broken: couldn't get a snapshot for #{item_id} {item['title']}, "
-                "and GEMINI_API_KEY isn't set so the AI fallback was skipped. "
-                "Set it and run /fix again, or fix manually with /remove + /add."
+                f"❌ Still broken: #{item_id} {item['title']} — GEMINI_API_KEY not set so "
+                "tiers 3 and 4 were skipped.\nSet it and run /fix again, or: " + hint
             )
 
         self.db.update_item(item_id, last_snapshot=snap, broken=0)
         self.db.log_event(item_id, "scraper_fixed", f"manual /fix via {method}")
-        if method != "AI fallback" and item.get("selector"):
-            # The old selector clearly still works (that's how we got snap),
-            # so nothing to clear here - only AI-fallback recoveries skip
-            # selector clearing in the background check; a manual /fix that
-            # succeeded via selector/heuristic just means it healed on its own.
-            pass
         return (
             f"✅ Fixed #{item_id} {item['title']} via {method}.\n"
-            f"Current latest: {snap}"
+            f"Latest: {snap}"
         )
 
     def _cmd_ask(self, rest):
         if not rest.strip():
             return "Format: /ask &lt;whatever you want to say&gt;"
         from bot import ai_agent  # lazy import - only needed if /ask is used
-        return ai_agent.ask(self, rest)
+        return ai_agent.ask(self, rest, user_id=getattr(self, '_current_user_id', 0))
 
     # ---------------- background check cycle ----------------
 
@@ -527,11 +563,21 @@ class Brain:
                 snap = ai_snap
                 used_ai_fallback = True
 
+        # Tier 4: web search by title — fires when the page itself is
+        # unreachable (down, geo-blocked, behind JS). Gemini searches live
+        # for the novel's latest chapter using only its name.
+        used_websearch = False
+        if snap is None:
+            ws_snap = fetch_snapshot_websearch(item["title"])
+            if ws_snap is not None:
+                snap = ws_snap
+                used_websearch = True
+
         # Still no snapshot — mark or stay broken.
         if snap is None:
             if not item.get("broken"):
                 self.db.update_item(item["id"], broken=1)
-                self.db.log_event(item["id"], "scraper_broken", "scrape failed")
+                self.db.log_event(item["id"], "scraper_broken", "all 4 tiers failed")
                 msg = f"⚠️ Tracking broke for novel #{item['id']} {item['title']}"
                 self._notify(msg)
                 return msg
@@ -540,7 +586,12 @@ class Brain:
         # If we got here with a broken item, it healed itself.
         if item.get("broken"):
             self.db.update_item(item["id"], broken=0)
-            recover_detail = "AI fallback found a snapshot" if used_ai_fallback else "auto-healed"
+            if used_websearch:
+                recover_detail = "web search fallback found a snapshot"
+            elif used_ai_fallback:
+                recover_detail = "AI fallback found a snapshot"
+            else:
+                recover_detail = "auto-healed"
             self.db.log_event(item["id"], "scraper_recovered", recover_detail)
             recovery_msg = f"✅ #{item['id']} {item['title']} is back! Scraper recovered."
             self._notify(recovery_msg)
@@ -550,7 +601,7 @@ class Brain:
             # it just because the AI fallback fired - that's a per-cycle
             # cost, not a one-time fix, so leave the selector in place in
             # case the next normal check works again on its own.
-            if selector_failed and not used_ai_fallback:
+            if selector_failed and not used_ai_fallback and not used_websearch:
                 self.db.update_item(item["id"], selector=None)
                 self.db.log_event(item["id"], "selector_cleared",
                                   "old selector stopped working, cleared")
