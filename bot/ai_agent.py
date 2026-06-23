@@ -192,7 +192,11 @@ SYSTEM_INSTRUCTION = (
 
 
 def ask(brain, text: str) -> str:
-    """Entry point called by brain.py's /ask command."""
+    """Entry point called by brain.py's /ask command.
+
+    Retries up to 3 times on transient server errors (503 UNAVAILABLE,
+    429 RESOURCE_EXHAUSTED) with exponential back-off before giving up.
+    """
     client = _get_client()
     if client is None:
         return (
@@ -201,18 +205,47 @@ def ask(brain, text: str) -> str:
             ".env file, then restart the bot."
         )
 
-    try:
-        from google.genai import types
+    import time
 
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        response = client.models.generate_content(
-            model=model,
-            contents=text,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=_build_tools(brain),
-            ),
+    _RETRYABLE = ("503", "503 UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+                  "UNAVAILABLE", "overloaded")
+    MAX_RETRIES = 3
+    BACKOFF_BASE = 2  # seconds; doubles each attempt: 2s, 4s, 8s
+
+    from google.genai import types
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        tools=_build_tools(brain),
+    )
+
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=text,
+                config=config,
+            )
+            return response.text or "(no response)"
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            is_retryable = any(token.lower() in err_str.lower()
+                               for token in _RETRYABLE)
+            if is_retryable and attempt < MAX_RETRIES:
+                wait = BACKOFF_BASE ** attempt
+                time.sleep(wait)
+                continue
+            # Non-retryable error, or exhausted retries — bail out
+            break
+
+    # Friendly message depending on whether it was an overload
+    err_str = str(last_err)
+    if any(token.lower() in err_str.lower() for token in _RETRYABLE):
+        return (
+            "Gemini's servers are overloaded right now (503). "
+            "Try again in a minute — this is on Google's side, not the bot."
         )
-        return response.text or "(no response)"
-    except Exception as e:
-        return f"Natural-language request failed: {e}"
+    return f"Natural-language request failed: {last_err}"
