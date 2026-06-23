@@ -120,17 +120,50 @@ def _build_tools(brain):
             return f"No item with id {item_id}."
         return "\n".join(f"{k}: {v}" for k, v in item.items())
 
+    def get_library_data(item_type: str = "", status: str = "") -> str:
+        """Get the FULL library as raw structured data (one line per item:
+        id, type, title, status, rating, progress, tags, last_snapshot,
+        broken), not the pretty-printed cards from list_library. Use this
+        whenever the user asks you to rank, sort, filter, compare, or do
+        any math/aggregation across multiple items - e.g. 'lowest rated',
+        'which novels have no rating yet', 'how many have I completed',
+        'what genres am I reading'. Do the sorting/filtering/counting
+        yourself from this data; don't say you can't if this tool gives you
+        everything you need to answer. item_type can be 'novel', 'anime',
+        or empty for both. status filters the same way as list_library."""
+        items = brain.db.list_items(item_type or None, status or None)
+        if not items:
+            return "Library is empty."
+        lines = []
+        for it in items:
+            lines.append(
+                f"id={it['id']} type={it['type']} title={it['title']!r} "
+                f"status={it['status']} rating={it.get('rating')} "
+                f"progress={it.get('progress_current')}/{it.get('progress_total')} "
+                f"tags={it.get('tags') or ''} "
+                f"last_snapshot={it.get('last_snapshot') or ''} "
+                f"broken={bool(it.get('broken'))}"
+            )
+        return "\n".join(lines)
+
     def run_health_check() -> str:
         """Run the bot's own health check (DB connectivity, scheduler status, etc).
         Use this if the user asks whether the bot itself is healthy/working."""
         return brain.handle("/health")
+
+    def force_fix_scraper(item_id: int) -> str:
+        """Force an immediate retry of a broken novel's scraper (selector,
+        then the chapter heuristic, then the AI fallback as a last resort).
+        Use this when the user asks to fix/retry/unbreak a specific tracked
+        novel right now, instead of waiting for the next scheduled check."""
+        return brain.handle(f"/fix {item_id}")
 
     return [
         add_novel, add_anime, list_library, set_status,
         rate_item, add_tag, remove_item, check_for_updates,
         get_history, get_stats, set_progress, set_note,
         find_items, get_recent, get_broken, get_item_details,
-        run_health_check,
+        get_library_data, run_health_check, force_fix_scraper,
     ]
 
 
@@ -143,8 +176,15 @@ SYSTEM_INSTRUCTION = (
     "You can answer ANY question about the bot's data: library contents, "
     "an item's full stored details (URL, selector, progress, notes, broken "
     "status, timestamps...), history of events, stats, recently updated "
-    "items, broken scrapers, or the bot's own health. If no tool fits a "
-    "question, say so plainly rather than guessing. "
+    "items, broken scrapers, or the bot's own health. "
+    "For anything involving ranking, sorting, filtering, comparing, or "
+    "counting across multiple items (lowest/highest rated, unrated items, "
+    "how many completed, which novels are broken, etc), call "
+    "get_library_data to get the full library as structured data, then do "
+    "the sorting/filtering/math yourself - don't say you can't answer just "
+    "because there's no single tool that already does the ranking for you. "
+    "If a question genuinely needs data no tool provides, say so plainly "
+    "rather than guessing. "
     "Keep replies short and to the point, suitable for a chat message. "
     "If a request is ambiguous (e.g. which item id), ask a brief "
     "clarifying question instead of guessing."
@@ -164,7 +204,7 @@ def ask(brain, text: str) -> str:
     try:
         from google.genai import types
 
-        model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         response = client.models.generate_content(
             model=model,
             contents=text,

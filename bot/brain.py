@@ -3,6 +3,8 @@ brain.py - the one place all command logic lives. Telegram and WhatsApp
 adapters just pass raw text in here and send back whatever string comes out.
 This is what makes "one library across both apps" work.
 """
+import os
+
 from bot.storage import Storage
 from bot.scraper import fetch_snapshot, fetch_snapshot_ai, ScrapeError
 from bot import anilist
@@ -25,6 +27,7 @@ HELP_TEXT = """\
 /check — force an update check now
 /recent [days] — items updated recently (default 7d)
 /broken — list items with broken scrapers
+/fix &lt;id&gt; — force-retry a broken novel right now (selector → heuristic → AI fallback)
 /history — recent event log
 /stats — quick counts
 /health — system health status
@@ -72,6 +75,7 @@ class Brain:
             "check": self._cmd_check,
             "recent": self._cmd_recent,
             "broken": self._cmd_broken,
+            "fix": self._cmd_fix,
             "history": self._cmd_history,
             "stats": self._cmd_stats,
             "health": self._cmd_health,
@@ -400,6 +404,72 @@ class Brain:
             return "No broken items — everything is healthy! ✓"
         cards = [self._format_item_card(it) for it in items]
         return f"<b>⚠️ Broken items ({len(items)}):</b>\n\n" + "\n\n".join(cards)
+
+    def _cmd_fix(self, rest):
+        rest = rest.strip()
+        if not rest:
+            return "Format: /fix <id> — force-retry a broken novel's scraper right now (uses the AI fallback if needed)."
+        try:
+            item_id = int(rest.split()[0])
+        except ValueError:
+            return "Item id must be a number, e.g. /fix 236"
+
+        item = self.db.get_item(item_id)
+        if not item:
+            return f"No item with id {item_id}."
+        if item["type"] != "novel":
+            return f"#{item_id} {item['title']} isn't a novel - only novels have scrapers to fix."
+        if not item.get("url"):
+            return f"#{item_id} {item['title']} has no URL on file - nothing to scrape."
+
+        # Same order as a normal check: selector -> heuristic -> AI fallback.
+        # Unlike a normal check, this runs even if the item isn't currently
+        # marked broken, and reports exactly which method worked.
+        snap = None
+        method = None
+        try:
+            snap = fetch_snapshot(item["url"], item.get("selector"))
+            method = "selector" if item.get("selector") else "heuristic"
+        except ScrapeError:
+            pass
+
+        if snap is None and item.get("selector"):
+            try:
+                snap = fetch_snapshot(item["url"], None)
+                method = "heuristic"
+            except ScrapeError:
+                pass
+
+        if snap is None:
+            snap = fetch_snapshot_ai(item["url"])
+            if snap is not None:
+                method = "AI fallback"
+
+        if snap is None:
+            if os.getenv("GEMINI_API_KEY"):
+                return (
+                    f"Still broken: couldn't get a snapshot for #{item_id} {item['title']} "
+                    "even with the AI fallback. The page may be down, geo-blocked, or "
+                    "behind something the scraper can't get past."
+                )
+            return (
+                f"Still broken: couldn't get a snapshot for #{item_id} {item['title']}, "
+                "and GEMINI_API_KEY isn't set so the AI fallback was skipped. "
+                "Set it and run /fix again, or fix manually with /remove + /add."
+            )
+
+        self.db.update_item(item_id, last_snapshot=snap, broken=0)
+        self.db.log_event(item_id, "scraper_fixed", f"manual /fix via {method}")
+        if method != "AI fallback" and item.get("selector"):
+            # The old selector clearly still works (that's how we got snap),
+            # so nothing to clear here - only AI-fallback recoveries skip
+            # selector clearing in the background check; a manual /fix that
+            # succeeded via selector/heuristic just means it healed on its own.
+            pass
+        return (
+            f"✅ Fixed #{item_id} {item['title']} via {method}.\n"
+            f"Current latest: {snap}"
+        )
 
     def _cmd_ask(self, rest):
         if not rest.strip():
