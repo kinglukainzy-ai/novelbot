@@ -193,12 +193,15 @@ def _build_tools(brain):
         Use this if the user asks whether the bot itself is healthy/working."""
         return brain.handle("/health")
 
-    def force_fix_scraper(item_id: int) -> str:
-        """Force the full 4-tier repair pipeline on a novel right now:
-        selector → heuristic → AI page-read → AI web search by title.
-        Use when the user asks to fix/retry/unbreak a specific novel.
-        The web search tier fires last and uses only the novel's name,
-        so it works even when the page itself is unreachable."""
+    def force_fix_scraper(item_id: int = 0, all_broken: bool = False) -> str:
+        """Run the full 4-tier repair pipeline (selector → heuristic → AI
+        page-read → AI web search by title). Set all_broken=True when the
+        user says things like 'fix everything', 'fix all broken', 'repair
+        all' — runs on every broken novel at once. Pass item_id when fixing
+        a specific novel. The web search tier works even when the page is
+        completely unreachable."""
+        if all_broken:
+            return brain.handle("/fix broken")
         return brain.handle(f"/fix {item_id}")
 
     def clear_broken_flag(item_id: int) -> str:

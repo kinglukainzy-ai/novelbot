@@ -411,11 +411,61 @@ class Brain:
         if not rest:
             return (
                 "Format:\n"
-                "  /fix <id>        — run the full 4-tier repair pipeline right now\n"
-                "  /fix clear <id>  — manually clear the broken flag (no scrape attempt)"
+                "  /fix broken       — run 4-tier pipeline on ALL broken novels at once\n"
+                "  /fix <id>         — run the pipeline on one specific novel\n"
+                "  /fix clear <id>   — manually clear the broken flag (no scrape attempt)"
             )
 
         parts = rest.split()
+
+        # ── /fix broken ───────────────────────────────────────────────────────
+        if parts[0].lower() == "broken":
+            broken = self.db.broken_items()
+            if not broken:
+                return "No broken items — nothing to fix! ✓"
+            novels = [it for it in broken if it["type"] == "novel"]
+            skipped = [it for it in broken if it["type"] != "novel"]
+            if not novels:
+                return (
+                    f"No broken novels to fix ({len(skipped)} broken anime item(s) "
+                    "can't be scraper-fixed — they track via AniList automatically)."
+                )
+            lines = [f"Running 4-tier fix on {len(novels)} broken novel(s)...\n"]
+            fixed = 0
+            still_broken = 0
+            for item in novels:
+                snap, method = None, None
+                try:
+                    snap = fetch_snapshot(item["url"], item.get("selector"))
+                    method = "selector" if item.get("selector") else "heuristic"
+                except ScrapeError:
+                    pass
+                if snap is None and item.get("selector"):
+                    try:
+                        snap = fetch_snapshot(item["url"], None)
+                        method = "heuristic"
+                    except ScrapeError:
+                        pass
+                if snap is None:
+                    snap = fetch_snapshot_ai(item["url"])
+                    if snap is not None:
+                        method = "AI page-read"
+                if snap is None:
+                    snap = fetch_snapshot_websearch(item["title"])
+                    if snap is not None:
+                        method = "AI web search"
+                if snap is not None:
+                    self.db.update_item(item["id"], last_snapshot=snap, broken=0)
+                    self.db.log_event(item["id"], "scraper_fixed", f"bulk /fix broken via {method}")
+                    lines.append(f"  ✅ #{item['id']} {item['title']} — fixed via {method}")
+                    fixed += 1
+                else:
+                    lines.append(f"  ❌ #{item['id']} {item['title']} — all 4 tiers failed")
+                    still_broken += 1
+            lines.append("\nDone: " + str(fixed) + " fixed, " + str(still_broken) + " still broken.")
+            if still_broken:
+                lines.append("Use /fix clear <id> to manually dismiss any you know are fine.")
+            return "\n".join(lines)
 
         # ── /fix clear <id> ──────────────────────────────────────────────────
         if parts[0].lower() == "clear":
