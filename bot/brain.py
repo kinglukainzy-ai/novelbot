@@ -174,62 +174,114 @@ class Brain:
 
     @staticmethod
     def _format_item_card(it):
-        """Build a mini-card string for a single library item (HTML formatted)."""
+        """Build a compact single-item card (HTML). Used by /status, /find, etc."""
         icon = "📖" if it["type"] == "novel" else "📺"
         broken = " ⚠️" if it.get("broken") else ""
-        title = it["title"]
-        header = f"{icon} #{it['id']} — <b>{title}</b>{broken}"
+        header = f"{icon} #{it['id']} — <b>{it['title']}</b>{broken}"
 
-        details = [f"Status: {it['status']}"]
+        parts = []
+        if it["type"] == "novel":
+            label = "Ch."
+        else:
+            label = "Ep."
+
         if it.get("progress_current"):
             prog = str(it["progress_current"])
             if it.get("progress_total"):
                 prog += f"/{it['progress_total']}"
-            details.append(f"Progress: {prog}")
+            parts.append(f"{label} {prog}")
+
         if it.get("rating"):
-            details.append(f"Rating: {it['rating']}/10")
-        if it.get("last_snapshot"):
-            details.append(f"Latest: {it['last_snapshot']}")
+            parts.append(f"{it['rating']}/10 ⭐")
 
-        return header + "\n" + "  |  ".join(details)
+        if it.get("last_snapshot") and it["type"] == "novel":
+            snap = it["last_snapshot"]
+            if len(snap) > 40:
+                snap = snap[:40] + "…"
+            parts.append(snap)
 
-    PAGE_SIZE = 10
+        line2 = "  |  ".join(parts) if parts else it.get("status", "")
+        return header + "\n  " + line2
+
+    PAGE_SIZE = 15
 
     def _cmd_list(self, rest):
         args = rest.split()
-        type_ = None
-        status = None
+        filter_type = None
+        filter_status = None
+        filter_tag = None
         page = 1
+
         for a in args:
-            if a.lower() in ("novel", "anime"):
-                type_ = a.lower()
-            elif a.lower() in VALID_STATUSES:
-                status = a.lower()
+            al = a.lower()
+            if al in ("novel", "anime"):
+                filter_type = al
+            elif al in VALID_STATUSES:
+                filter_status = al
+            elif al.startswith("tag:"):
+                filter_tag = al[4:]
             else:
                 try:
                     page = max(1, int(a))
                 except ValueError:
                     pass
-        items = self.db.list_items(type_=type_, status=status)
-        if not items:
-            return "Nothing here yet. Use /add novel or /add anime to start."
 
-        total = len(items)
-        total_pages = (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        all_items = self.db.list_items(type_=filter_type, status=filter_status)
+
+        # tag filter (post-query since storage doesn't expose it)
+        if filter_tag:
+            all_items = [i for i in all_items
+                         if filter_tag.lower() in (i.get("tags") or "").lower()]
+
+        if not all_items:
+            return "Nothing matches. Use /add novel or /add anime to start tracking."
+
+        # ── group by type when no type filter ─────────────────────────────────
+        if filter_type is None:
+            novels = [i for i in all_items if i["type"] == "novel"]
+            anime  = [i for i in all_items if i["type"] == "anime"]
+            sections = []
+
+            for group, label, icon in [(novels, "Novels", "📖"), (anime, "Anime", "📺")]:
+                if not group:
+                    continue
+                broken_count = sum(1 for i in group if i.get("broken"))
+                broken_note = f"  ⚠️ {broken_count} broken" if broken_count else ""
+                header = f"{icon} <b>{label}</b> ({len(group)}){broken_note}"
+
+                # paginate within each group independently? No — paginate the full
+                # list after grouping. Simpler: just show all up to PAGE_SIZE total.
+                cards = [Brain._format_item_card(i) for i in group]
+                sections.append(header + "\n\n" + "\n\n".join(cards))
+
+            result = ("\n\n" + "─" * 20 + "\n\n").join(sections)
+
+            total = len(all_items)
+            if total > self.PAGE_SIZE:
+                result += f"\n\n— Showing all {total} items. Use /list novel or /list anime to filter."
+            return result.strip()
+
+        # ── single-type view with pagination ──────────────────────────────────
+        total = len(all_items)
+        total_pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         page = min(page, total_pages)
         start = (page - 1) * self.PAGE_SIZE
-        page_items = items[start : start + self.PAGE_SIZE]
+        page_items = all_items[start: start + self.PAGE_SIZE]
 
-        cards = [self._format_item_card(it) for it in page_items]
-        result = "\n\n".join(cards)
+        icon = "📖" if filter_type == "novel" else "📺"
+        label = "Novels" if filter_type == "novel" else "Anime"
+        broken_count = sum(1 for i in all_items if i.get("broken"))
+        broken_note = f"  ⚠️ {broken_count} broken" if broken_count else ""
+        header = f"{icon} <b>{label}</b> ({total}){broken_note}"
+
+        cards = [Brain._format_item_card(i) for i in page_items]
+        result = header + "\n\n" + "\n\n".join(cards)
 
         if total_pages > 1:
-            # Rebuild the filter part so the footer hint is copy-pasteable
-            filter_parts = " ".join(p for p in [type_, status] if p)
-            next_hint = f"/list {filter_parts} {page + 1}".strip() if page < total_pages else None
-            footer = f"\n\n— Page {page}/{total_pages} ({total} items)"
-            if next_hint:
-                footer += f"  →  send {next_hint}"
+            filter_parts = " ".join(p for p in [filter_type, filter_status] if p)
+            footer = f"\n\n— Page {page}/{total_pages}"
+            if page < total_pages:
+                footer += f"  →  /list {filter_parts} {page + 1}".strip()
             result += footer
 
         return result
