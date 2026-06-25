@@ -57,6 +57,26 @@ class Storage:
                     FOREIGN KEY(item_id) REFERENCES items(id)
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.commit()
+
+    def get_setting(self, key, default=None):
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        with _lock, self._conn() as c:
+            c.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)),
+            )
             c.commit()
 
     def _migrate_add_columns(self, c):
@@ -68,6 +88,8 @@ class Storage:
             "progress_total": "INTEGER",
             "last_chapter_title": "TEXT",
             "last_read_at": "TEXT",
+            "last_broken_retry_at": "TEXT",  # throttles tier 3/4 retries on confirmed-broken items
+            "last_chapter_num": "INTEGER",   # parsed chapter number, used by the tier-0 increment probe
         }
         for col, coltype in new_cols.items():
             if col not in existing:

@@ -1,4 +1,8 @@
-# Novel/Anime Tracker Bot
+# 🪶 Thoth — Novel/Anime Tracker Bot
+
+Named for the Egyptian god of wisdom: it doesn't just remind you a chapter
+dropped, it tries hard not to bother you with noise about its own plumbing
+along the way.
 
 Tracks specific novels (by URL) and anime (via AniList) for new chapters/
 episodes, keeps a personal library with status/ratings/tags, and notifies

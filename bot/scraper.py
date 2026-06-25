@@ -2,17 +2,25 @@
 scraper.py - fetches a novel's page and extracts a "snapshot" (usually the
 latest chapter title/number) so we can detect when it changes.
 
-Two modes:
+Tiers, cheapest/most-reliable first:
 1. With a CSS selector  -> grabs the text of that element (most reliable,
    user supplies it once when adding the novel).
 2. Without a selector    -> falls back to a heuristic: look for the first
-   link/text containing the word "chapter" near the top of the page. This
-   is best-effort and more likely to break on unusual site layouts.
+   link/text containing the word "chapter" near the top of the page.
+3. Local LLM (local_llm.py) -> page loaded fine but tiers 1-2 found nothing
+   (unusual layout). Hands the already-fetched text to a local model - no
+   internet access needed for this step, since the page is already in hand.
+4. Gemini web search (fetch_snapshot_websearch) -> the page itself is
+   unreachable, so there's no text for tier 3 to read. This is the one
+   tier that genuinely needs to leave the box.
 """
 import hashlib
 import os
+import time
 import requests
 from bs4 import BeautifulSoup
+
+from bot import local_llm
 
 HEADERS = {
     "User-Agent": (
@@ -25,6 +33,14 @@ TIMEOUT = 15
 
 
 class ScrapeError(Exception):
+    pass
+
+
+class PageUnreachable(ScrapeError):
+    """The page itself couldn't be loaded at all (down, geo-blocked, DNS,
+    timeout...) - distinct from 'loaded fine but nothing matched', so
+    callers can tell 'tier 3 never got a chance to look' apart from
+    'tier 3 looked and found nothing'."""
     pass
 
 
@@ -72,98 +88,164 @@ def snapshot_hash(snapshot: str) -> str:
     return hashlib.sha256(snapshot.encode("utf-8")).hexdigest()[:16]
 
 
-def fetch_snapshot_ai(url: str) -> str | None:
-    """Last-resort fallback for when fetch_snapshot() has already failed with
-    both a selector and the 'chapter' heuristic (e.g. a site redesign, or a
-    layout the heuristic just doesn't understand). Re-fetches the page and
-    hands its visible text to Gemini, asking it to point out the latest
-    chapter marker.
+def parse_chapter_number(snapshot: str) -> int | None:
+    """Pulls the first chapter number out of a snapshot string, e.g.
+    'Chapter 551 (END) - Epilogue 5' -> 551. Used to populate
+    last_chapter_num, which powers the cheap next-chapter probe shortcut.
+    Returns None if no number is found - not every site's snapshot text
+    contains one, and that's fine, the probe shortcut just won't apply."""
+    import re
+    m = re.search(r"chapter\s+(\d+)", snapshot, re.IGNORECASE)
+    return int(m.group(1)) if m else None
 
-    Returns None - never raises - if GEMINI_API_KEY isn't set, the page
-    can't be fetched, or Gemini can't find anything. This is intentionally
-    best-effort: callers already have their own broken/healthy bookkeeping
-    and should treat None exactly like any other failed scrape attempt.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return None
 
+def parse_chapter_number(snapshot: str) -> int | None:
+    """Pulls the first integer following the word 'chapter' out of a
+    snapshot string, e.g. 'Chapter 551 (END) - Epilogue 5' -> 551. Used to
+    drive the tier-0 increment probe and numeric /update reporting. Returns
+    None if no clean number is found - some sites' snapshot text never
+    contains one (just a title), and that's fine, it just means tier 0
+    doesn't apply to that item."""
+    import re
+    m = re.search(r"chapter\s+(\d+)", snapshot, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def fetch_page_text(url: str) -> str:
+    """Re-fetches a page and returns its stripped visible text (script/style
+    removed). Raises PageUnreachable - not the base ScrapeError - if the
+    fetch itself fails, so callers can tell that apart from 'loaded fine,
+    nothing useful in it'."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         resp.raise_for_status()
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        raise PageUnreachable(f"Could not fetch page: {e}")
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    # Strip script/style noise before handing text to the model.
     for tag in soup(["script", "style"]):
         tag.decompose()
-    page_text = soup.get_text(separator=" ", strip=True)[:6000]
+    return soup.get_text(separator=" ", strip=True)
+
+
+def fetch_snapshot_ai(url: str, title: str = "") -> str | None:
+    """Tier 3: local LLM page-read. Re-fetches the page (raises
+    PageUnreachable if that fails - tier 3 never got a chance to look) and
+    hands the visible text to a local Ollama model to find the latest
+    chapter marker.
+
+    Returns None - never raises ScrapeError - if Ollama isn't configured/
+    reachable, or the model genuinely finds nothing. PageUnreachable DOES
+    propagate, since that's a different situation (no text to even try on)
+    that callers should be able to tell apart from a clean 'not found'.
+    """
+    if not local_llm.is_configured():
+        return None
+
+    page_text = fetch_page_text(url)  # may raise PageUnreachable
     if not page_text:
         return None
 
-    try:
-        from google import genai
-
-        client = genai.Client(api_key=api_key)
-        model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        prompt = (
-            "Below is the visible text of a web novel's page. Find the "
-            "latest/newest chapter being shown (title and/or number). "
-            "Reply with ONLY that chapter marker, nothing else - no "
-            "explanation, no quotes. If you genuinely can't find one, "
-            "reply with exactly: NONE\n\n" + page_text
-        )
-        result = client.models.generate_content(model=model, contents=prompt)
-        out = (result.text or "").strip()
-    except Exception:
-        return None
-
-    if not out or out.upper() == "NONE":
-        return None
-    return out[:200]
+    return local_llm.extract_chapter_marker(title or url, page_text)
 
 
-def fetch_snapshot_websearch(title: str) -> str | None:
-    """Absolute last resort — when the page itself is unscrapeable (down,
-    geo-blocked, behind JS, fully redesigned), ask Gemini to do a live web
-    search for the novel's latest chapter by name.
+def _gemini_search(title: str):
+    """One Gemini web-search attempt. Returns the chapter text, or a
+    two-tuple-like sentinel distinguishing 'Gemini answered NONE' (a real
+    answer) from a raised exception (the call itself failed - busy/rate
+    limited/timed out, not a real answer). Raises on any API/network error
+    so the caller can apply retry/backoff and tell it apart from NONE."""
+    from google import genai
+    from google.genai import types
 
-    This deliberately uses Gemini's web_search tool rather than reading the
-    page, so it works even when the URL is completely unreachable.
-
-    Returns None - never raises - if GEMINI_API_KEY isn't set, the search
-    finds nothing, or anything else goes wrong.
-    """
     api_key = os.getenv("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    prompt = (
+        f"Search the web right now for the latest chapter of the web novel "
+        f"'{title}'. Reply with ONLY the chapter number and title "
+        f"(e.g. 'Chapter 412: The Final Battle'). "
+        f"If you genuinely cannot find it, reply with exactly: NONE"
+    )
+
+    result = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())]
+        ),
+    )
+    return (result.text or "").strip()
+
+
+def _tavily_search(title: str) -> str | None:
+    """Backup web-search path for when Gemini itself is unavailable, not a
+    routine second opinion. Uses Tavily's free tier (1,000 searches/month)
+    to fetch real results, then hands them to whatever's reachable for
+    extraction (local LLM first, since it's free and unlimited; this is
+    just text-in/text-out once we have real search results in hand)."""
+    api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
         return None
-
     try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-        prompt = (
-            f"Search the web right now for the latest chapter of the web novel "
-            f"'{title}'. Reply with ONLY the chapter number and title "
-            f"(e.g. 'Chapter 412: The Final Battle'). "
-            f"If you genuinely cannot find it, reply with exactly: NONE"
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": f"latest chapter of the web novel {title}",
+                "max_results": 5,
+            },
+            timeout=20,
         )
-
-        result = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-            ),
-        )
-        out = (result.text or "").strip()
-    except Exception:
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError):
         return None
 
-    if not out or out.upper() == "NONE":
+    snippets = " ".join(
+        r.get("content", "") for r in data.get("results", []) if r.get("content")
+    )
+    if not snippets:
         return None
-    return out[:200]
+
+    if local_llm.is_configured():
+        return local_llm.extract_chapter_marker(title, snippets)
+
+    # No local model available either - fall back to a plain heuristic
+    # scan of the snippets rather than giving up outright.
+    import re
+    m = re.search(r"chapter\s+\d+[^.]{0,80}", snippets, re.IGNORECASE)
+    return m.group(0).strip() if m else None
+
+
+def fetch_snapshot_websearch(title: str, retries: int = 2) -> str | None:
+    """Tier 4 - the only tier that genuinely needs live internet access,
+    since the page itself is unreachable here. Tries Gemini first (cheap,
+    generous free tier: ~1,500 requests/day), with retry/backoff for
+    transient failures. A *clean* 'NONE' answer from Gemini is treated as
+    a real result (genuinely not found). A *failed call* (rate limited,
+    timed out, 5xx) is NOT treated the same way - it triggers a retry, and
+    only falls through to the Tavily backup (a separate, flat-capped free
+    tier) after Gemini itself has had a fair shot. Returns None - never
+    raises - if nothing pans out, so this can never be the reason a check
+    cycle crashes.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        for attempt in range(retries + 1):
+            try:
+                out = _gemini_search(title)
+                if not out or out.upper() == "NONE":
+                    return None  # a real answer: genuinely not found
+                return out[:200]
+            except Exception:
+                if attempt < retries:
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                    continue
+                # Gemini itself never came through - fall through to the
+                # backup search tier below rather than giving up here.
+                break
+
+    return _tavily_search(title)
+

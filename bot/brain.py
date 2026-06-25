@@ -4,14 +4,27 @@ adapters just pass raw text in here and send back whatever string comes out.
 This is what makes "one library across both apps" work.
 """
 import os
+import datetime
 
 from bot.storage import Storage
-from bot.scraper import fetch_snapshot, fetch_snapshot_ai, fetch_snapshot_websearch, ScrapeError
-from bot import anilist
+from bot.scraper import (
+    fetch_snapshot, fetch_snapshot_ai, fetch_snapshot_websearch,
+    parse_chapter_number, ScrapeError, PageUnreachable,
+)
+from bot import anilist, novelfire
 
 VALID_STATUSES = ["reading", "watching", "on_hold", "completed", "dropped"]
 
+
+def _domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or url
+    except Exception:
+        return url
+
 HELP_TEXT = """\
+<b>🪶 Thoth</b> — your novel &amp; anime tracker
 <b>Commands</b>
 /add novel &lt;title&gt; — auto-find &amp; track via NovelFire
 /add novel &lt;title&gt; | &lt;url&gt; | [css selector] — track a novel from any site
@@ -23,8 +36,12 @@ HELP_TEXT = """\
 /rate &lt;id&gt; &lt;score&gt; [notes] — rate 0-10 with optional notes
 /note &lt;id&gt; &lt;text&gt; — add/update notes without rating
 /tag &lt;id&gt; &lt;tag&gt; — add a tag
+/set &lt;id&gt; url &lt;new url&gt; — fix a novel's source link in place
+/set &lt;id&gt; selector &lt;css|clear&gt; — fix/clear a novel's selector in place
 /remove &lt;id&gt; — stop tracking
 /check — force an update check now
+/next — time until the next scheduled check
+/sources — which scraping tiers are currently available
 /recent [days] — items updated recently (default 7d)
 /broken — list items with broken scrapers
 /fix &lt;id&gt; — force-retry a broken novel right now (selector → heuristic → AI fallback)
@@ -43,11 +60,15 @@ Or pin an exact source with | as separator, e.g.
 
 
 class Brain:
-    def __init__(self, db_path: str, notifier=None):
+    def __init__(self, db_path: str, notifier=None, check_interval_minutes=None):
         self.db = Storage(db_path)
         # notifier(text) -> sends a message out to the owning user(s).
         # Set by main.py once both adapters exist.
         self.notifier = notifier
+        # Used by /next to estimate the next scheduled check. Falls back to
+        # the env var directly if main.py didn't pass one explicitly, so
+        # this never silently breaks the check cycle if left unset.
+        self._check_interval_minutes = check_interval_minutes or int(os.getenv("CHECK_INTERVAL_MINUTES", "90"))
 
     # ---------------- public entrypoint ----------------
 
@@ -72,7 +93,10 @@ class Brain:
             "note": self._cmd_note,
             "tag": self._cmd_tag,
             "remove": self._cmd_remove,
+            "set": self._cmd_set,
             "check": self._cmd_check,
+            "next": self._cmd_next_check,
+            "sources": self._cmd_sources,
             "recent": self._cmd_recent,
             "broken": self._cmd_broken,
             "fix": self._cmd_fix,
@@ -119,7 +143,10 @@ class Brain:
                 try:
                     snap = fetch_snapshot(url, selector)
                 except ScrapeError as e:
-                    snap = fetch_snapshot_ai(url)
+                    try:
+                        snap = fetch_snapshot_ai(url, title)
+                    except PageUnreachable:
+                        snap = None
                     if snap is None:
                         self.db.update_item(item_id, broken=1)
                         self.db.log_event(item_id, "scraper_broken", str(e))
@@ -129,11 +156,10 @@ class Brain:
                             "It's marked broken until fixed - /broken to see it, /remove to drop it."
                         )
                     self.db.log_event(item_id, "scraper_ai_fallback", "selector/heuristic failed on add, AI found a snapshot")
-                self.db.update_item(item_id, last_snapshot=snap, broken=0)
+                self.db.update_item(item_id, last_snapshot=snap, last_chapter_num=parse_chapter_number(snap), broken=0)
                 return f"Tracking novel #{item_id}: {title}\nCurrent latest: {snap}"
 
             # ---- name-only mode: look it up on NovelFire, like /add anime ----
-            from bot import novelfire
             results = novelfire.search_novel(title)
             if not results:
                 return (
@@ -147,7 +173,8 @@ class Brain:
 
             item_id = self.db.add_item("novel", top["title"], url=top["url"])
             snap = novelfire.latest_chapter_snapshot(top["url"])
-            self.db.update_item(item_id, last_snapshot=snap, broken=0 if snap else 1)
+            self.db.update_item(item_id, last_snapshot=snap, last_chapter_num=parse_chapter_number(snap) if snap else None,
+                                 broken=0 if snap else 1)
 
             others = ", ".join(r["title"] for r in results[1:4] if r["url"] != top["url"])
             extra = f"\n(Other matches if this is wrong: {others})" if others else ""
@@ -174,7 +201,9 @@ class Brain:
 
     @staticmethod
     def _format_item_card(it):
-        """Build a compact single-item card (HTML). Used by /status, /find, etc."""
+        """Detailed two-line card (HTML). Used by /find, /broken, /recent -
+        contexts showing one item or a short, deliberate list, where the
+        extra detail per item is worth the space."""
         icon = "📖" if it["type"] == "novel" else "📺"
         broken = " ⚠️" if it.get("broken") else ""
         header = f"{icon} #{it['id']} — <b>{it['title']}</b>{broken}"
@@ -202,6 +231,28 @@ class Brain:
 
         line2 = "  |  ".join(parts) if parts else it.get("status", "")
         return header + "\n  " + line2
+
+    @staticmethod
+    def _format_item_line(it):
+        """One dense line per item - the default /list view dumps every
+        tracked item, so density matters more than detail here. Full detail
+        is one tap away via /find <title> or /status."""
+        icon = "📖" if it["type"] == "novel" else "📺"
+        broken = " ⚠️" if it.get("broken") else ""
+        label = "ch" if it["type"] == "novel" else "ep"
+
+        bits = []
+        if it.get("progress_current"):
+            prog = str(it["progress_current"])
+            if it.get("progress_total"):
+                prog += f"/{it['progress_total']}"
+            bits.append(f"{label}.{prog}")
+        if it.get("rating"):
+            bits.append(f"{it['rating']}/10⭐")
+        bits.append(it.get("status", ""))
+        detail = ", ".join(b for b in bits if b)
+
+        return f"{icon} #{it['id']} <b>{it['title']}</b>{broken} — {detail}"
 
     PAGE_SIZE = 15
 
@@ -236,10 +287,16 @@ class Brain:
         if not all_items:
             return "Nothing matches. Use /add novel or /add anime to start tracking."
 
+        total = len(all_items)
+        total_pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = min(page, total_pages)
+        start = (page - 1) * self.PAGE_SIZE
+        page_items = all_items[start: start + self.PAGE_SIZE]
+
         # ── group by type when no type filter ─────────────────────────────────
         if filter_type is None:
-            novels = [i for i in all_items if i["type"] == "novel"]
-            anime  = [i for i in all_items if i["type"] == "anime"]
+            novels = [i for i in page_items if i["type"] == "novel"]
+            anime  = [i for i in page_items if i["type"] == "anime"]
             sections = []
 
             for group, label, icon in [(novels, "Novels", "📖"), (anime, "Anime", "📺")]:
@@ -248,38 +305,22 @@ class Brain:
                 broken_count = sum(1 for i in group if i.get("broken"))
                 broken_note = f"  ⚠️ {broken_count} broken" if broken_count else ""
                 header = f"{icon} <b>{label}</b> ({len(group)}){broken_note}"
+                lines = [Brain._format_item_line(i) for i in group]
+                sections.append(header + "\n" + "\n".join(lines))
 
-                # paginate within each group independently? No — paginate the full
-                # list after grouping. Simpler: just show all up to PAGE_SIZE total.
-                cards = [Brain._format_item_card(i) for i in group]
-                sections.append(header + "\n\n" + "\n\n".join(cards))
-
-            result = ("\n\n" + "─" * 20 + "\n\n").join(sections)
-
-            total = len(all_items)
-            if total > self.PAGE_SIZE:
-                result += f"\n\n— Showing all {total} items. Use /list novel or /list anime to filter."
-            return result.strip()
-
-        # ── single-type view with pagination ──────────────────────────────────
-        total = len(all_items)
-        total_pages = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
-        page = min(page, total_pages)
-        start = (page - 1) * self.PAGE_SIZE
-        page_items = all_items[start: start + self.PAGE_SIZE]
-
-        icon = "📖" if filter_type == "novel" else "📺"
-        label = "Novels" if filter_type == "novel" else "Anime"
-        broken_count = sum(1 for i in all_items if i.get("broken"))
-        broken_note = f"  ⚠️ {broken_count} broken" if broken_count else ""
-        header = f"{icon} <b>{label}</b> ({total}){broken_note}"
-
-        cards = [Brain._format_item_card(i) for i in page_items]
-        result = header + "\n\n" + "\n\n".join(cards)
+            result = "\n\n".join(sections)
+        else:
+            icon = "📖" if filter_type == "novel" else "📺"
+            label = "Novels" if filter_type == "novel" else "Anime"
+            broken_count = sum(1 for i in all_items if i.get("broken"))
+            broken_note = f"  ⚠️ {broken_count} broken" if broken_count else ""
+            header = f"{icon} <b>{label}</b> ({total}){broken_note}"
+            lines = [Brain._format_item_line(i) for i in page_items]
+            result = header + "\n" + "\n".join(lines)
 
         if total_pages > 1:
             filter_parts = " ".join(p for p in [filter_type, filter_status] if p)
-            footer = f"\n\n— Page {page}/{total_pages}"
+            footer = f"\n\n— Page {page}/{total_pages} ({total} total)"
             if page < total_pages:
                 footer += f"  →  /list {filter_parts} {page + 1}".strip()
             result += footer
@@ -313,11 +354,16 @@ class Brain:
             score = float(parts[1])
         except ValueError:
             return "ID and score must be numbers."
-        notes = parts[2] if len(parts) > 2 else None
         item = self.db.get_item(item_id)
         if not item:
             return f"No item #{item_id}"
-        self.db.update_item(item_id, rating=score, notes=notes)
+        notes = parts[2] if len(parts) > 2 else None
+        fields = {"rating": score}
+        if notes:
+            # Only touch notes if new ones were actually given - rating
+            # alone shouldn't blank out notes written earlier.
+            fields["notes"] = notes
+        self.db.update_item(item_id, **fields)
         return f"Rated #{item_id} {item['title']}: {score}/10" + (f" - {notes}" if notes else "")
 
     def _cmd_tag(self, rest):
@@ -349,6 +395,97 @@ class Brain:
             return f"No item #{item_id}"
         self.db.delete_item(item_id)
         return f"Removed #{item_id}: {item['title']}"
+
+    def _cmd_set(self, rest):
+        """Fix a novel's url or selector in place - no need to /remove and
+        re-/add just because a site moved or a selector went stale (which
+        would also lose rating/tags/notes/progress)."""
+        parts = rest.split(" ", 2)
+        if len(parts) < 2:
+            return ("Format: /set &lt;id&gt; url &lt;new url&gt;\n"
+                     "or: /set &lt;id&gt; selector &lt;new css selector&gt;\n"
+                     "or: /set &lt;id&gt; selector clear")
+        try:
+            item_id = int(parts[0])
+        except ValueError:
+            return "ID must be a number."
+        field = parts[1].lower()
+        item = self.db.get_item(item_id)
+        if not item:
+            return f"No item #{item_id}"
+        if item["type"] != "novel":
+            return "Only novels have a url/selector to fix - anime is tracked via AniList automatically."
+
+        if field == "url":
+            if len(parts) < 3 or not parts[2].strip():
+                return "Format: /set &lt;id&gt; url &lt;new url&gt;"
+            new_url = parts[2].strip()
+            dup = self.db.find_by_url(new_url)
+            if dup and dup["id"] != item_id:
+                return f"That URL is already tracked as #{dup['id']}: {dup['title']}"
+            self.db.update_item(item_id, url=new_url, broken=0, last_broken_retry_at=None)
+            self.db.log_event(item_id, "url_updated", new_url)
+            try:
+                snap = fetch_snapshot(new_url, item.get("selector"))
+            except ScrapeError as e:
+                self.db.update_item(item_id, broken=1)
+                return (
+                    f"URL updated for #{item_id} {item['title']}, but I still couldn't verify it: {e}\n"
+                    "Still marked broken - try /set &lt;id&gt; selector &lt;css&gt; if the page "
+                    "loaded but nothing matched."
+                )
+            self.db.update_item(item_id, last_snapshot=snap, last_chapter_num=parse_chapter_number(snap), broken=0)
+            return f"URL updated for #{item_id} {item['title']}\nCurrent latest: {snap}"
+
+        elif field == "selector":
+            raw = parts[2].strip() if len(parts) > 2 else ""
+            new_selector = None if raw.lower() in ("", "clear", "none") else raw
+            self.db.update_item(item_id, selector=new_selector, broken=0, last_broken_retry_at=None)
+            self.db.log_event(item_id, "selector_updated", new_selector or "(cleared)")
+            try:
+                snap = fetch_snapshot(item["url"], new_selector)
+            except ScrapeError as e:
+                self.db.update_item(item_id, broken=1)
+                return f"Selector updated for #{item_id} {item['title']}, but I still couldn't verify it: {e}"
+            self.db.update_item(item_id, last_snapshot=snap, last_chapter_num=parse_chapter_number(snap), broken=0)
+            return f"Selector updated for #{item_id} {item['title']}\nCurrent latest: {snap}"
+
+        else:
+            return ("Format: /set &lt;id&gt; url &lt;new url&gt;\n"
+                     "or: /set &lt;id&gt; selector &lt;new css selector|clear&gt;")
+
+    def _cmd_next_check(self, _):
+        last_at = self.db.get_setting("last_check_at")
+        interval_min = self.db.get_setting("check_interval_minutes")
+        if not last_at or not interval_min:
+            return "No scheduled check has run yet - one will kick off shortly after the bot starts."
+        try:
+            last_dt = datetime.datetime.fromisoformat(last_at)
+            next_dt = last_dt + datetime.timedelta(minutes=float(interval_min))
+            now = datetime.datetime.now(datetime.timezone.utc)
+            remaining = next_dt - now
+            mins_left = max(0, int(remaining.total_seconds() // 60))
+            if mins_left == 0:
+                return "A check is due any moment now."
+            return f"Last check: {last_at[:16]} UTC\nNext check in ~{mins_left} minute(s)."
+        except (ValueError, TypeError):
+            return "Couldn't work out the schedule - try /check to run one now."
+
+    def _cmd_sources(self, _):
+        from bot import local_llm
+        lines = ["<b>Scraper tiers</b>"]
+        lines.append("1-2. Selector / heuristic — always available (plain HTTP, no API key)")
+        local_ok = local_llm.is_configured()
+        lines.append(f"3. Local LLM (page-read) — {'✅ available' if local_ok else '❌ not running (OLLAMA_HOST)'}")
+        gemini_ok = bool(os.getenv("GEMINI_API_KEY"))
+        lines.append(f"4a. Gemini web search — {'✅ configured' if gemini_ok else '❌ no GEMINI_API_KEY'}")
+        tavily_ok = bool(os.getenv("TAVILY_API_KEY"))
+        lines.append(f"4b. Tavily web search (backup) — {'✅ configured' if tavily_ok else '❌ no TAVILY_API_KEY'}")
+        novels = [i for i in self.db.list_items(type_="novel")]
+        domains = sorted({_domain_of(i["url"]) for i in novels if i.get("url")})
+        if domains:
+            lines.append(f"\nSites currently tracked: {', '.join(domains)}")
+        return "\n".join(lines)
 
     def _cmd_check(self, _):
         results = self.run_check_cycle()
@@ -482,7 +619,6 @@ class Brain:
                     f"No broken novels to fix ({len(skipped)} broken anime item(s) "
                     "can't be scraper-fixed — they track via AniList automatically)."
                 )
-            lines = [f"Running 4-tier fix on {len(novels)} broken novel(s)...\n"]
             fixed = 0
             still_broken = 0
             for item in novels:
@@ -499,24 +635,29 @@ class Brain:
                     except ScrapeError:
                         pass
                 if snap is None:
-                    snap = fetch_snapshot_ai(item["url"])
-                    if snap is not None:
-                        method = "AI page-read"
+                    try:
+                        snap = fetch_snapshot_ai(item["url"], item["title"])
+                        if snap is not None:
+                            method = "local LLM page-read"
+                    except PageUnreachable:
+                        pass
                 if snap is None:
                     snap = fetch_snapshot_websearch(item["title"])
                     if snap is not None:
-                        method = "AI web search"
+                        method = "web search"
                 if snap is not None:
-                    self.db.update_item(item["id"], last_snapshot=snap, broken=0)
+                    self.db.update_item(item["id"], last_snapshot=snap,
+                                         last_chapter_num=parse_chapter_number(snap), broken=0)
                     self.db.log_event(item["id"], "scraper_fixed", f"bulk /fix broken via {method}")
-                    lines.append(f"  ✅ #{item['id']} {item['title']} — fixed via {method}")
                     fixed += 1
                 else:
-                    lines.append(f"  ❌ #{item['id']} {item['title']} — all 4 tiers failed")
                     still_broken += 1
-            lines.append("\nDone: " + str(fixed) + " fixed, " + str(still_broken) + " still broken.")
+            lines = [f"⚙️ Ran the fix pipeline on {len(novels)} broken novel(s): "
+                     f"✅ {fixed} fixed, ❌ {still_broken} still broken."]
+            if fixed:
+                lines.append("/recent for what changed.")
             if still_broken:
-                lines.append("Use /fix clear <id> to manually dismiss any you know are fine.")
+                lines.append("/broken for the list, /fix &lt;id&gt; selector clear to manually dismiss any you know are fine.")
             return "\n".join(lines)
 
         # ── /fix clear <id> ──────────────────────────────────────────────────
@@ -574,35 +715,45 @@ class Brain:
             except ScrapeError:
                 pass
 
-        # Tier 3: AI reads the page text
+        # Tier 3: local LLM reads the page text
+        page_unreachable = False
         if snap is None:
-            snap = fetch_snapshot_ai(item["url"])
-            if snap is not None:
-                method = "AI page-read"
+            try:
+                snap = fetch_snapshot_ai(item["url"], item["title"])
+                if snap is not None:
+                    method = "local LLM page-read"
+            except PageUnreachable:
+                page_unreachable = True
 
         # Tier 4: AI web search by title — page itself may be unreachable
         if snap is None:
             snap = fetch_snapshot_websearch(item["title"])
             if snap is not None:
-                method = "AI web search"
+                method = "web search"
 
         if snap is None:
             hint = (
                 "Use /fix clear {id} to manually dismiss the broken flag if "
                 "you're sure the novel is fine."
             ).format(id=item_id)
-            if os.getenv("GEMINI_API_KEY"):
+            if page_unreachable:
                 return (
-                    f"❌ Still broken: all 4 tiers failed for #{item_id} {item['title']}.\n"
+                    f"❌ Still broken: #{item_id} {item['title']} — the page itself is unreachable, "
+                    "and the web-search fallback also came up empty.\n"
                     "The page may be permanently down, geo-blocked, or behind a login wall.\n"
                     + hint
                 )
+            if not os.getenv("GEMINI_API_KEY") and not os.getenv("TAVILY_API_KEY"):
+                return (
+                    f"❌ Still broken: #{item_id} {item['title']} — no GEMINI_API_KEY or "
+                    "TAVILY_API_KEY set, so tier 4 (web search) was effectively a no-op.\n"
+                    "Set one and run /fix again, or: " + hint
+                )
             return (
-                f"❌ Still broken: #{item_id} {item['title']} — GEMINI_API_KEY not set so "
-                "tiers 3 and 4 were skipped.\nSet it and run /fix again, or: " + hint
+                f"❌ Still broken: all 4 tiers failed for #{item_id} {item['title']}.\n" + hint
             )
 
-        self.db.update_item(item_id, last_snapshot=snap, broken=0)
+        self.db.update_item(item_id, last_snapshot=snap, last_chapter_num=parse_chapter_number(snap), broken=0)
         self.db.log_event(item_id, "scraper_fixed", f"manual /fix via {method}")
         return (
             f"✅ Fixed #{item_id} {item['title']} via {method}.\n"
@@ -617,90 +768,177 @@ class Brain:
 
     # ---------------- background check cycle ----------------
 
+    BROKEN_RETRY_HOURS = 24  # how often to re-run tiers 3/4 on a confirmed-broken item
+
     def run_check_cycle(self):
         """
-        Called by the scheduler (and by /check). Returns a list of
-        human-readable update strings, and fires self.notifier for each
-        one if a notifier is set (used by the scheduler for push alerts).
+        Called by the scheduler (and by /check). Broken/recovered counts are
+        aggregated into one numeric summary (not a ping per title - flapping
+        items used to mean a wall of messages); new chapters are still
+        listed by title, since that's the actual point of the bot. Fires
+        self.notifier once at the end with everything combined, if there's
+        anything to report.
         """
-        messages = []
+        self.db.set_setting("last_check_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
+        self.db.set_setting("check_interval_minutes", self._check_interval_minutes or 90)
+
+        broken_count = 0
+        recovered_count = 0
+        new_chapter_lines = []
+        error_count = 0
+
         for item in self.db.all_active_items():
             try:
                 if item["type"] == "novel":
-                    msg = self._check_novel(item)
+                    event = self._check_novel(item)
                 else:
-                    msg = self._check_anime(item)
-                if msg:
-                    messages.append(msg)
+                    event = self._check_anime(item)
             except Exception as e:
-                messages.append(f"Error checking #{item['id']} {item['title']}: {e}")
-        return messages
+                error_count += 1
+                self.db.log_event(item["id"], "check_error", str(e))
+                continue
+
+            if not event:
+                continue
+            if event["kind"] == "broken":
+                broken_count += 1
+            elif event["kind"] == "recovered":
+                recovered_count += 1
+            elif event["kind"] in ("new_chapter", "new_episode"):
+                new_chapter_lines.append(event["text"])
+
+        summary_parts = []
+        if broken_count or recovered_count:
+            bits = []
+            if broken_count:
+                bits.append(f"⚠️ {broken_count} broke")
+            if recovered_count:
+                bits.append(f"✅ {recovered_count} recovered")
+            summary_parts.append(", ".join(bits) + " — /broken for details")
+        if error_count:
+            summary_parts.append(f"({error_count} check error(s) — /history for details)")
+
+        all_lines = summary_parts + new_chapter_lines
+        if all_lines:
+            self._notify("\n".join(all_lines))
+        return all_lines
 
     def _check_novel(self, item):
+        """Returns a structured event dict ({'kind', 'text', ...}) or None
+        if nothing changed. Caller (run_check_cycle) aggregates these into
+        one summary instead of pinging per item."""
         snap = None
         selector_failed = False
+        already_broken = bool(item.get("broken"))
 
-        # Primary scrape attempt (with selector if set).
-        try:
-            snap = fetch_snapshot(item["url"], item.get("selector"))
-        except ScrapeError:
-            selector_failed = True
-
-        # Fallback: if the selector broke, retry without it. Selectors go
-        # stale on site redesigns but the URL itself is usually still good.
-        if selector_failed and item.get("selector"):
+        # Tier 0: NovelFire numeric probe. Cheapest, most reliable signal -
+        # checks whether chapter N+1's URL exists directly, sidestepping
+        # text-matching entirely. A clean "doesn't exist yet" answer also
+        # proves the site itself is reachable right now, so the common
+        # steady-state "nothing new" case can skip tiers 1-2 as well, not
+        # just the AI tiers.
+        skip_to_tier3 = False
+        current_num = item.get("last_chapter_num")
+        if current_num:
             try:
-                snap = fetch_snapshot(item["url"], None)
+                probe = novelfire.probe_next_chapter(item["url"], current_num)
+            except novelfire.ProbeAmbiguous:
+                probe = None  # couldn't tell - fall through to the normal pipeline
+            if probe is not None:
+                found, probe_snap = probe
+                if found:
+                    snap = probe_snap
+                    skip_to_tier3 = True  # got a real answer, no need for tiers 1-2
+                elif not already_broken:
+                    # Confirmed: site's up, just nothing new yet. Nothing more to do.
+                    return None
+
+        # Tier 1/2: selector, then no-selector heuristic. Cheap (plain HTTP),
+        # so these always run every cycle regardless of broken status - no
+        # reason to throttle a free check that might heal itself for free.
+        if snap is None:
+            try:
+                snap = fetch_snapshot(item["url"], item.get("selector"))
             except ScrapeError:
-                pass  # genuine failure, handled below
+                selector_failed = True
 
-        # Last resort: both the selector and the "chapter" heuristic came up
-        # empty (e.g. full site redesign). Ask Gemini to find the latest
-        # chapter marker in the page text. Only fires when genuinely broken,
-        # and is a no-op (returns None) if GEMINI_API_KEY isn't set.
+            if selector_failed and item.get("selector"):
+                try:
+                    snap = fetch_snapshot(item["url"], None)
+                except ScrapeError:
+                    pass  # genuine failure, handled below
+
+        # Throttle: tiers 3/4 are the expensive ones (local LLM inference,
+        # external API calls). Once an item is confirmed broken, retrying
+        # those every cycle burns quota for no benefit - once a day is
+        # plenty until a /fix or /set actually changes something.
+        retry_due = True
+        if already_broken and snap is None:
+            last_retry = item.get("last_broken_retry_at")
+            if last_retry:
+                try:
+                    last_dt = datetime.datetime.fromisoformat(last_retry)
+                    age_hours = (datetime.datetime.now(datetime.timezone.utc) - last_dt).total_seconds() / 3600
+                    retry_due = age_hours >= self.BROKEN_RETRY_HOURS
+                except ValueError:
+                    retry_due = True
+
         used_ai_fallback = False
-        if snap is None:
-            ai_snap = fetch_snapshot_ai(item["url"])
-            if ai_snap is not None:
-                snap = ai_snap
-                used_ai_fallback = True
-
-        # Tier 4: web search by title — fires when the page itself is
-        # unreachable (down, geo-blocked, behind JS). Gemini searches live
-        # for the novel's latest chapter using only its name.
         used_websearch = False
-        if snap is None:
-            ws_snap = fetch_snapshot_websearch(item["title"])
-            if ws_snap is not None:
-                snap = ws_snap
-                used_websearch = True
+        page_unreachable = False
+
+        if snap is None and retry_due and not skip_to_tier3:
+            self.db.update_item(item["id"], last_broken_retry_at=self._now_iso())
+
+            # Tier 3: local LLM page-read. PageUnreachable means tier 3 never
+            # got a chance to look (no text to read) - that's tracked
+            # separately from "looked and found nothing" for a clearer
+            # audit trail, but either way we fall through to tier 4.
+            try:
+                ai_snap = fetch_snapshot_ai(item["url"], item["title"])
+                if ai_snap is not None:
+                    snap = ai_snap
+                    used_ai_fallback = True
+            except PageUnreachable:
+                page_unreachable = True
+
+            # Tier 4: web search by title - the one tier that genuinely
+            # needs live internet access, since there's no page text to
+            # read (either PageUnreachable above, or tier 3 read it and
+            # came up empty).
+            if snap is None:
+                ws_snap = fetch_snapshot_websearch(item["title"])
+                if ws_snap is not None:
+                    snap = ws_snap
+                    used_websearch = True
 
         # Still no snapshot — mark or stay broken.
         if snap is None:
-            if not item.get("broken"):
-                self.db.update_item(item["id"], broken=1)
-                self.db.log_event(item["id"], "scraper_broken", "all 4 tiers failed")
-                msg = f"⚠️ Tracking broke for novel #{item['id']} {item['title']}"
-                self._notify(msg)
-                return msg
-            return None  # already known broken, don't spam
+            if not already_broken:
+                self.db.update_item(item["id"], broken=1, last_broken_retry_at=self._now_iso())
+                detail = "page unreachable, tiers 3-4 attempted by title" if page_unreachable else "all tiers failed"
+                self.db.log_event(item["id"], "scraper_broken", detail)
+                return {"kind": "broken", "id": item["id"], "title": item["title"]}
+            return None  # already known broken (or not yet due for retry) - don't spam
+
+        chapter_num = parse_chapter_number(snap) or current_num
 
         # If we got here with a broken item, it healed itself.
-        if item.get("broken"):
+        if already_broken:
             self.db.update_item(item["id"], broken=0)
             if used_websearch:
                 recover_detail = "web search fallback found a snapshot"
             elif used_ai_fallback:
-                recover_detail = "AI fallback found a snapshot"
+                recover_detail = "local LLM fallback found a snapshot"
+            elif skip_to_tier3:
+                recover_detail = "tier-0 chapter probe found a snapshot"
             else:
                 recover_detail = "auto-healed"
             self.db.log_event(item["id"], "scraper_recovered", recover_detail)
-            recovery_msg = f"✅ #{item['id']} {item['title']} is back! Scraper recovered."
-            self._notify(recovery_msg)
 
             # If the selector was the problem, clear it so future checks
             # don't keep failing and falling back every cycle. Don't clear
-            # it just because the AI fallback fired - that's a per-cycle
+            # it just because a fallback tier fired - that's a per-cycle
             # cost, not a one-time fix, so leave the selector in place in
             # case the next normal check works again on its own.
             if selector_failed and not used_ai_fallback and not used_websearch:
@@ -708,12 +946,17 @@ class Brain:
                 self.db.log_event(item["id"], "selector_cleared",
                                   "old selector stopped working, cleared")
 
-        if snap != item.get("last_snapshot"):
-            self.db.update_item(item["id"], last_snapshot=snap)
+            if snap == item.get("last_snapshot"):
+                return {"kind": "recovered", "id": item["id"], "title": item["title"]}
+            self.db.update_item(item["id"], last_snapshot=snap, last_chapter_num=chapter_num)
             self.db.log_event(item["id"], "new_chapter", snap)
-            msg = f"New update for {item['title']}: {snap}"
-            self._notify(msg)
-            return msg
+            return {"kind": "recovered", "id": item["id"], "title": item["title"]}
+
+        if snap != item.get("last_snapshot"):
+            self.db.update_item(item["id"], last_snapshot=snap, last_chapter_num=chapter_num)
+            self.db.log_event(item["id"], "new_chapter", snap)
+            return {"kind": "new_chapter", "id": item["id"], "title": item["title"],
+                    "text": f"📖 New update for {item['title']}: {snap}"}
         return None
 
     def _check_anime(self, item):
@@ -723,10 +966,13 @@ class Brain:
         if state["snapshot"] != item.get("last_snapshot"):
             self.db.update_item(item["id"], last_snapshot=state["snapshot"])
             self.db.log_event(item["id"], "new_episode", state["snapshot"])
-            msg = f"New episode for {item['title']}: {state['snapshot']}"
-            self._notify(msg)
-            return msg
+            return {"kind": "new_episode", "id": item["id"], "title": item["title"],
+                    "text": f"📺 New episode for {item['title']}: {state['snapshot']}"}
         return None
+
+    @staticmethod
+    def _now_iso():
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     def _notify(self, msg):
         if self.notifier:
