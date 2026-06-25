@@ -13,22 +13,38 @@ job is figuring out which tool(s) to call from a natural-language
 sentence, including read-only questions about the library/database,
 recommendations, and multi-turn conversations.
 
+ORCHESTRATION
+-------------
+The local Ollama model (same one used for scraper tier 3) drives the
+tool-calling loop whenever it's configured/reachable - it decides which
+tools to call, executes them, and answers, entirely offline. Gemini is
+reduced to a single tool (web_lookup) that the local model can reach for
+ONLY when a question genuinely needs live external information none of
+the other tools can provide - general knowledge for recommendations,
+current real-world facts, etc. This means the vast majority of /ask
+traffic (library questions, ratings, status changes, recommendations
+based on your own data) no longer depends on Gemini being up at all.
+
+If Ollama isn't configured, /ask falls back to the original all-Gemini
+path so it still works without any local setup.
+
 CONVERSATION MEMORY
 -------------------
-Each Telegram user_id gets a short rolling history (up to HISTORY_TURNS
-turns). This means:
-  - After Gemini asks "Have you watched X?", the user can reply with just
+Each user_id gets a short rolling history (up to HISTORY_TURNS turns),
+stored in a neutral {"role": "user"|"assistant", "content": "..."} shape
+usable by both backends. This means:
+  - After the bot asks "Have you watched X?", the user can reply with just
     "yes" or "no" and the context is preserved.
   - "Add the first one" after a recommendation list works correctly.
   - /ask clear  resets the conversation history for the current user.
 
-Uses Gemini's native SDK (google-genai) directly - no agent framework.
-Gemini's automatic function calling handles the tool-call loop.
-
-Free API key: https://aistudio.google.com/apikey
+Free Gemini API key (only needed for the web_lookup escape hatch and the
+no-Ollama fallback path): https://aistudio.google.com/apikey
 """
+import inspect
 import os
 import time
+import requests
 from collections import deque
 
 # ---------------------------------------------------------------------------
@@ -51,12 +67,12 @@ def _get_client():
 
 # ---------------------------------------------------------------------------
 # Per-user conversation history
-# Each entry is a dict: {"role": "user"|"model", "parts": [{"text": "..."}]}
-# We keep the last HISTORY_TURNS *pairs* (user + model), so max
-# HISTORY_TURNS * 2 entries in the deque.
+# Neutral shape - {"role": "user"|"assistant", "content": "..."} - works for
+# both the Ollama path and (after a small conversion) the Gemini fallback.
+# Keeps the last HISTORY_TURNS *pairs* (user + assistant).
 # ---------------------------------------------------------------------------
-HISTORY_TURNS = 6          # how many back-and-forth exchanges to remember
-_history: dict[int, deque] = {}   # user_id -> deque of message dicts
+HISTORY_TURNS = 6
+_history: dict[int, deque] = {}
 
 
 def _get_history(user_id: int) -> list:
@@ -65,10 +81,10 @@ def _get_history(user_id: int) -> list:
     return list(_history[user_id])
 
 
-def _append_history(user_id: int, role: str, text: str):
+def _append_history(user_id: int, role: str, content: str):
     if user_id not in _history:
         _history[user_id] = deque(maxlen=HISTORY_TURNS * 2)
-    _history[user_id].append({"role": role, "parts": [{"text": text}]})
+    _history[user_id].append({"role": role, "content": content})
 
 
 def clear_history(user_id: int):
@@ -216,12 +232,24 @@ def _build_tools(brain):
         bot will re-mark it broken on the next scheduled check."""
         return brain.handle(f"/fix clear {item_id}")
 
+    def web_lookup(query: str) -> str:
+        """Search the live web for current, real-world information that
+        none of the other tools can provide - e.g. general facts about a
+        book/show/genre not in the library, recent news, or anything that
+        needs up-to-date knowledge beyond what you already know. This is
+        the ONLY tool that leaves the bot's own data - use it sparingly,
+        only when the question genuinely needs live external information.
+        Do NOT use this for anything about the user's own tracked library;
+        the other tools already cover that with zero cost or delay."""
+        return _gemini_web_lookup(query)
+
     return [
         add_novel, add_anime, list_library, set_status,
         rate_item, add_tag, remove_item, check_for_updates,
         get_history, get_stats, set_progress, set_note,
         find_items, get_recent, get_broken, get_item_details,
         get_library_data, run_health_check, force_fix_scraper, clear_broken_flag,
+        web_lookup,
     ]
 
 
@@ -294,6 +322,123 @@ _RETRYABLE = ("503", "503 UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
               "UNAVAILABLE", "overloaded")
 MAX_RETRIES = 3
 BACKOFF_BASE = 2  # seconds; doubles each attempt: 2s, 4s, 8s
+GEMINI_FALLBACK_MODELS = ["gemini-2.5-flash-lite"]  # tried after the primary model
+
+
+def _gemini_web_lookup(query: str) -> str:
+    """The one remaining path to Gemini from the local-orchestrated agent -
+    only reached when the local model calls the web_lookup tool. Tries the
+    configured model first, with retry/backoff for transient overload, then
+    falls back to a second model (separate quota pool) before giving up -
+    this is deliberately more resilient than a single model/attempt, since
+    it's the one tool that's allowed to actually fail the whole request."""
+    client = _get_client()
+    if client is None:
+        return "Web lookup unavailable - no GEMINI_API_KEY configured."
+
+    from google.genai import types
+    models_to_try = [os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), *GEMINI_FALLBACK_MODELS]
+    last_err = None
+    for model in models_to_try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                result = client.models.generate_content(
+                    model=model,
+                    contents=query,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())]
+                    ),
+                )
+                return result.text or "(no results found)"
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if any(t.lower() in err_str.lower() for t in _RETRYABLE) and attempt < MAX_RETRIES:
+                    time.sleep(BACKOFF_BASE ** attempt)
+                    continue
+                break  # this model's exhausted its retries - try the next one
+    return f"Web lookup failed - Gemini unavailable on all models tried: {last_err}"
+
+
+# ---------------------------------------------------------------------------
+# Ollama tool-calling support
+# ---------------------------------------------------------------------------
+_PY_TYPE_TO_JSON = {str: "string", int: "integer", float: "number", bool: "boolean"}
+OLLAMA_MAX_TOOL_ITERATIONS = 6
+OLLAMA_CHAT_TIMEOUT = 120
+
+
+def _function_to_ollama_schema(fn) -> dict:
+    """Auto-derives an Ollama/OpenAI-style tool schema from a plain Python
+    function's signature + docstring, so the same _build_tools() functions
+    work for both backends without hand-writing 21 schemas twice."""
+    sig = inspect.signature(fn)
+    props, required = {}, []
+    for name, param in sig.parameters.items():
+        ptype = param.annotation if param.annotation is not inspect.Parameter.empty else str
+        props[name] = {"type": _PY_TYPE_TO_JSON.get(ptype, "string")}
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+    return {
+        "type": "function",
+        "function": {
+            "name": fn.__name__,
+            "description": (fn.__doc__ or "").strip(),
+            "parameters": {"type": "object", "properties": props, "required": required},
+        },
+    }
+
+
+def _run_ollama_agent(brain, user_id: int, text: str) -> str:
+    from bot import local_llm
+
+    py_tools = _build_tools(brain)
+    tool_map = {fn.__name__: fn for fn in py_tools}
+    ollama_tools = [_function_to_ollama_schema(fn) for fn in py_tools]
+
+    history = _get_history(user_id)
+    messages = ([{"role": "system", "content": SYSTEM_INSTRUCTION}]
+                + history + [{"role": "user", "content": text}])
+
+    model = os.getenv("OLLAMA_MODEL", "phi4-mini")
+    host = local_llm._ollama_host()
+
+    for _ in range(OLLAMA_MAX_TOOL_ITERATIONS):
+        try:
+            resp = requests.post(
+                f"{host}/api/chat",
+                json={"model": model, "messages": messages, "tools": ollama_tools, "stream": False},
+                timeout=OLLAMA_CHAT_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            return f"Local model error: {e}"
+
+        msg = data.get("message", {}) or {}
+        tool_calls = msg.get("tool_calls") or []
+
+        if not tool_calls:
+            reply = (msg.get("content") or "").strip() or "(no response)"
+            _append_history(user_id, "user", text)
+            _append_history(user_id, "assistant", reply)
+            return reply
+
+        messages.append(msg)
+        for call in tool_calls:
+            fn_name = (call.get("function") or {}).get("name")
+            fn_args = (call.get("function") or {}).get("arguments") or {}
+            fn = tool_map.get(fn_name)
+            if not fn:
+                result = f"Unknown tool: {fn_name}"
+            else:
+                try:
+                    result = fn(**fn_args)
+                except Exception as e:
+                    result = f"Tool error calling {fn_name}: {e}"
+            messages.append({"role": "tool", "content": str(result), "name": fn_name or ""})
+
+    return "I made too many tool calls in a row without reaching an answer - try rephrasing the question."
 
 
 # ---------------------------------------------------------------------------
@@ -302,24 +447,42 @@ BACKOFF_BASE = 2  # seconds; doubles each attempt: 2s, 4s, 8s
 def ask(brain, text: str, user_id: int = 0) -> str:
     """Entry point called by brain.py's /ask command.
 
-    user_id is the Telegram user id — used to maintain per-user conversation
-    history so multi-turn exchanges (recommendations, yes/no questions, etc.)
-    work correctly. Pass 0 if the caller doesn't have a user id (falls back
-    to a shared single-user history).
+    user_id - used to maintain per-user conversation history so multi-turn
+    exchanges (recommendations, yes/no questions, etc.) work correctly.
+    Pass 0 if the caller doesn't have a user id (shared single-user history).
 
     Special command: if text.strip().lower() == 'clear', wipes history and
-    returns a confirmation message without hitting the API.
+    returns a confirmation message without hitting any API.
+
+    Routing: if a local Ollama model is configured/reachable, it drives the
+    entire tool-calling loop and Gemini is only touched via the web_lookup
+    tool, and only when the local model decides it's actually needed. If no
+    local model is configured, falls back to the original all-Gemini path
+    so /ask still works without any local setup.
     """
     if text.strip().lower() == "clear":
         clear_history(user_id)
         return "Conversation history cleared. Starting fresh."
 
+    from bot import local_llm
+    if local_llm.is_configured():
+        return _run_ollama_agent(brain, user_id, text)
+
+    return _ask_gemini(brain, text, user_id)
+
+
+def _ask_gemini(brain, text: str, user_id: int = 0) -> str:
+    """Fallback path used only when no local Ollama model is configured -
+    everything (orchestration AND any live lookups) runs through Gemini,
+    same as before the local-first split existed."""
     client = _get_client()
     if client is None:
         return (
             "Natural-language mode isn't set up yet. Get a free Gemini API key "
             "at https://aistudio.google.com/apikey and set GEMINI_API_KEY in your "
-            ".env file, then restart the bot."
+            ".env file, then restart the bot. (Or set up a local Ollama model - "
+            "see OLLAMA_HOST/OLLAMA_MODEL in .env - so /ask doesn't depend on "
+            "Gemini at all for most questions.)"
         )
 
     from google.genai import types
@@ -330,9 +493,14 @@ def ask(brain, text: str, user_id: int = 0) -> str:
         tools=_build_tools(brain),
     )
 
-    # Build contents = history + new user message
+    # Convert neutral history ({"role":"user"/"assistant","content":...}) to
+    # Gemini's contents shape ({"role":"user"/"model","parts":[{"text":...}]}).
     history = _get_history(user_id)
-    contents = history + [{"role": "user", "parts": [{"text": text}]}]
+    contents = [
+        {"role": ("model" if h["role"] == "assistant" else "user"),
+         "parts": [{"text": h["content"]}]}
+        for h in history
+    ] + [{"role": "user", "parts": [{"text": text}]}]
 
     last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -344,9 +512,8 @@ def ask(brain, text: str, user_id: int = 0) -> str:
             )
             reply = response.text or "(no response)"
 
-            # Persist this turn into history
             _append_history(user_id, "user", text)
-            _append_history(user_id, "model", reply)
+            _append_history(user_id, "assistant", reply)
 
             return reply
 
@@ -364,6 +531,8 @@ def ask(brain, text: str, user_id: int = 0) -> str:
     if any(token.lower() in err_str.lower() for token in _RETRYABLE):
         return (
             "Gemini's servers are overloaded right now (503). "
-            "Try again in a minute — this is on Google's side, not the bot."
+            "Try again in a minute — this is on Google's side, not the bot. "
+            "(Setting up a local Ollama model would make /ask work even when "
+            "this happens - see OLLAMA_HOST/OLLAMA_MODEL in .env.)"
         )
     return f"Natural-language request failed: {last_err}"
