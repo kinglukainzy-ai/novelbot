@@ -84,7 +84,7 @@ def extract_chapter_marker(title: str, page_text: str) -> str | None:
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
-                "options": {"temperature": 0},
+                "options": {"temperature": 0, "num_predict": 40},
                 "stream": False,
             },
             timeout=TIMEOUT,
@@ -94,6 +94,13 @@ def extract_chapter_marker(title: str, page_text: str) -> str | None:
     except (requests.RequestException, ValueError, KeyError):
         return None
 
+    if not out:
+        return None
+    # Small models tend to answer correctly on the first line, then ramble
+    # with restatements/asides afterward (observed: "Chapter 412: The Final
+    # Battle...\n\nLatest/Newest Chapter Mentioned:\n..."). Cut there rather
+    # than trusting the whole blob.
+    out = out.splitlines()[0].strip()
     if not out or out.upper().startswith("NONE"):
         return None
     out = out[:200]
