@@ -365,7 +365,12 @@ def _gemini_web_lookup(query: str) -> str:
 # ---------------------------------------------------------------------------
 _PY_TYPE_TO_JSON = {str: "string", int: "integer", float: "number", bool: "boolean"}
 OLLAMA_MAX_TOOL_ITERATIONS = 6
-OLLAMA_CHAT_TIMEOUT = 120
+OLLAMA_CHAT_TIMEOUT = 180
+# Caps output length so a rambling response can't run unbounded on CPU, and
+# keeps the model loaded in RAM between requests so we don't repay the
+# multi-second reload cost on every single /ask.
+OLLAMA_CHAT_OPTIONS = {"num_predict": 300, "temperature": 0.4}
+OLLAMA_KEEP_ALIVE = "30m"
 
 
 def _function_to_ollama_schema(fn) -> dict:
@@ -407,7 +412,14 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
         try:
             resp = requests.post(
                 f"{host}/api/chat",
-                json={"model": model, "messages": messages, "tools": ollama_tools, "stream": False},
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "tools": ollama_tools,
+                    "stream": False,
+                    "options": OLLAMA_CHAT_OPTIONS,
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
+                },
                 timeout=OLLAMA_CHAT_TIMEOUT,
             )
             resp.raise_for_status()
