@@ -164,15 +164,20 @@ def _build_tools(brain):
 
     def get_library_data(item_type: str = "", status: str = "") -> str:
         """Get the FULL library as raw structured data (one line per item:
-        id, type, title, status, rating, progress, tags, last_snapshot,
-        broken), not the pretty-printed cards from list_library. Use this
-        whenever the user asks you to rank, sort, filter, compare, or do
-        any math/aggregation across multiple items - e.g. 'lowest rated',
-        'which novels have no rating yet', 'how many have I completed',
-        'what genres am I reading'. Do the sorting/filtering/counting
-        yourself from this data; don't say you can't if this tool gives you
-        everything you need to answer. item_type can be 'novel', 'anime',
-        or empty for both. status filters the same way as list_library."""
+        id, type, title, status, rating, progress, tags, broken), not the
+        pretty-printed cards from list_library. Use this whenever the user
+        asks you to rank, sort, filter, compare, or do any math/aggregation
+        across multiple items - e.g. 'lowest rated', 'which novels have no
+        rating yet', 'how many have I completed', 'what genres am I
+        reading'. Do the sorting/filtering/counting yourself from this
+        data; don't say you can't if this tool gives you everything you
+        need to answer. item_type can be 'novel', 'anime', or empty for
+        both. status filters the same way as list_library.
+
+        Note: this deliberately leaves out last_snapshot to keep the
+        payload light on a large library - call get_item_details(id) for
+        a specific item's full detail (including its latest snapshot) once
+        you've identified which item(s) the user actually cares about."""
         items = brain.db.list_items(item_type or None, status or None)
         if not items:
             return "Library is empty."
@@ -183,7 +188,6 @@ def _build_tools(brain):
                 f"status={it['status']} rating={it.get('rating')} "
                 f"progress={it.get('progress_current')}/{it.get('progress_total')} "
                 f"tags={it.get('tags') or ''} "
-                f"last_snapshot={it.get('last_snapshot') or ''} "
                 f"broken={bool(it.get('broken'))}"
             )
         return "\n".join(lines)
