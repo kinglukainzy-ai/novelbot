@@ -394,10 +394,32 @@ def _function_to_ollama_schema(fn) -> dict:
     }
 
 
+# Words that signal the message actually needs library data / a tool call.
+# If none of these appear, we skip attaching the 21-tool schema entirely -
+# that schema alone costs ~85s of extra CPU prompt-eval per turn (measured:
+# 3s with no tools vs 90s with tools, for the literal same "hey"), so paying
+# it for plain small talk is pure waste. This is a heuristic, not perfect -
+# if it guesses wrong, the no-tools reply will just be a plain chat answer
+# rather than a data lookup; worth widening this list if that happens often.
+_TOOL_TRIGGER_WORDS = (
+    "add", "list", "track", "status", "rate", "rating", "top", "best",
+    "highest", "lowest", "recommend", "suggest", "broken", "fix", "set",
+    "remove", "delete", "stats", "history", "progress", "chapter",
+    "source", "next", "update", "tag", "note", "library", "reading",
+    "watching", "anime", "novel", "book", "find", "search",
+)
+
+
+def _needs_tools(text: str) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in _TOOL_TRIGGER_WORDS)
+
+
 def _run_ollama_agent(brain, user_id: int, text: str) -> str:
     from bot import local_llm
 
-    py_tools = _build_tools(brain)
+    use_tools = _needs_tools(text)
+    py_tools = _build_tools(brain) if use_tools else []
     tool_map = {fn.__name__: fn for fn in py_tools}
     ollama_tools = [_function_to_ollama_schema(fn) for fn in py_tools]
 
@@ -415,7 +437,7 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
                 json={
                     "model": model,
                     "messages": messages,
-                    "tools": ollama_tools,
+                    **({"tools": ollama_tools} if ollama_tools else {}),
                     "stream": False,
                     "options": OLLAMA_CHAT_OPTIONS,
                     "keep_alive": OLLAMA_KEEP_ALIVE,

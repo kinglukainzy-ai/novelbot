@@ -74,7 +74,8 @@ class DiscordAdapter:
 
     async def _run_and_reply(self, channel, text: str, user_id: int):
         try:
-            reply = self.brain.handle(text, user_id=user_id)
+            loop = asyncio.get_running_loop()
+            reply = await loop.run_in_executor(None, self.brain.handle, text, user_id)
             if not reply:
                 reply = "(No response)"
             reply_md = _html_to_discord(reply)
@@ -91,7 +92,8 @@ class DiscordAdapter:
             return
         self._known_channel_ids.add(interaction.channel_id)
         await interaction.response.defer()
-        reply = self.brain.handle(command, user_id=interaction.user.id)
+        loop = asyncio.get_running_loop()
+        reply = await loop.run_in_executor(None, self.brain.handle, command, interaction.user.id)
         if not reply:
             reply = "(No response)"
         reply_md = _html_to_discord(reply)
