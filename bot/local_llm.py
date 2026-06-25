@@ -41,26 +41,68 @@ def is_configured() -> bool:
 def extract_chapter_marker(title: str, page_text: str) -> str | None:
     """Hands already-fetched page text to a local model and asks it to
     point out the latest chapter marker. page_text should already be
-    trimmed to visible text (script/style stripped) by the caller."""
+    trimmed to visible text (script/style stripped) by the caller.
+
+    Two defenses against a small model "continuing the story" instead of
+    reading it (this is a real, observed failure mode - phi4-mini given a
+    single blob of text via /api/generate once returned a chapter number
+    that simply wasn't in the source, having treated the prompt as
+    something to continue rather than extract from):
+
+    1. Use /api/chat with a separate system instruction + temperature 0,
+       which instruct models follow far more reliably than one continuous
+       prompt that reads like the start of a story.
+    2. Grounding check: whatever chapter number comes back MUST actually
+       appear in the source text, or the result is discarded as a failed
+       extraction (None) rather than trusted. This makes a hallucinated
+       number structurally impossible to act on, regardless of how the
+       model misbehaves.
+    """
+    import re
+
     model = os.getenv("OLLAMA_MODEL", "phi4-mini")
-    prompt = (
-        f"Below is the visible text of the web novel '{title}'s page. "
-        "Find the latest/newest chapter being shown (title and/or number). "
-        "Reply with ONLY that chapter marker, nothing else - no explanation, "
-        "no quotes. If you genuinely can't find one, reply with exactly: "
-        "NONE\n\n" + page_text[:6000]
+    system_msg = (
+        "You extract information from text. You never invent, continue, or "
+        "guess - you only repeat back what is literally present in the text "
+        "you are given. If the requested information is not present, you "
+        "say so exactly as instructed."
+    )
+    user_msg = (
+        f"Here is the visible text of the '{title}' book page:\n\n"
+        f"---\n{page_text[:6000]}\n---\n\n"
+        "Find the latest/newest chapter mentioned in that text above "
+        "(its title and/or number). Reply with ONLY that chapter marker, "
+        "copied exactly as it appears - no explanation, no extra words. "
+        "If no chapter is mentioned in the text, reply with exactly: NONE"
     )
     try:
         resp = requests.post(
-            f"{_ollama_host()}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
+            f"{_ollama_host()}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "options": {"temperature": 0},
+                "stream": False,
+            },
             timeout=TIMEOUT,
         )
         resp.raise_for_status()
-        out = (resp.json().get("response") or "").strip()
-    except (requests.RequestException, ValueError):
+        out = (resp.json().get("message", {}).get("content") or "").strip()
+    except (requests.RequestException, ValueError, KeyError):
         return None
 
     if not out or out.upper().startswith("NONE"):
         return None
-    return out[:200]
+    out = out[:200]
+
+    # Grounding check: a chapter number in the answer must actually be
+    # present in the source text, or this is a hallucination, not an
+    # extraction - discard it rather than risk acting on a wrong number.
+    answer_num = re.search(r"\d+", out)
+    if answer_num and answer_num.group(0) not in page_text:
+        return None
+
+    return out
