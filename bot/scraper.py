@@ -221,16 +221,26 @@ def _tavily_search(title: str) -> str | None:
 
 def fetch_snapshot_websearch(title: str, retries: int = 2) -> str | None:
     """Tier 4 - the only tier that genuinely needs live internet access,
-    since the page itself is unreachable here. Tries Gemini first (cheap,
-    generous free tier: ~1,500 requests/day), with retry/backoff for
-    transient failures. A *clean* 'NONE' answer from Gemini is treated as
-    a real result (genuinely not found). A *failed call* (rate limited,
-    timed out, 5xx) is NOT treated the same way - it triggers a retry, and
-    only falls through to the Tavily backup (a separate, flat-capped free
-    tier) after Gemini itself has had a fair shot. Returns None - never
-    raises - if nothing pans out, so this can never be the reason a check
-    cycle crashes.
+    since the page itself is unreachable here. Tries the self-hosted
+    SearXNG instance first (no API key, no quota - see bot/websearch.py).
+    Only falls back to the Gemini -> Tavily chain below if SEARXNG_URL was
+    never configured, so existing setups that haven't migrated yet don't
+    lose this tier outright. Returns None - never raises - if nothing
+    pans out, so this can never be the reason a check cycle crashes.
     """
+    from bot import websearch
+    if websearch.is_configured():
+        results = websearch.search(f"latest chapter of the web novel {title}")
+        if results:
+            snippets = " ".join(r["content"] for r in results if r.get("content"))
+            if snippets:
+                if local_llm.is_configured():
+                    return local_llm.extract_chapter_marker(title, snippets)
+                import re
+                m = re.search(r"chapter\s+\d+[^.]{0,80}", snippets, re.IGNORECASE)
+                return m.group(0).strip() if m else None
+        return None  # SearXNG is up; a clean empty result is a real answer
+
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         for attempt in range(retries + 1):

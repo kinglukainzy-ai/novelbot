@@ -1,0 +1,50 @@
+# docker-compose.searxng.yml - self-hosted web search, no API key.
+#
+# Run alongside the bot (and Ollama, if that's also containerized) so the
+# bot has a tier-4 web-search path that never depends on a third-party
+# API quota. Start it with:
+#
+#   docker compose -f docker-compose.searxng.yml up -d
+#
+# Then set in your .env:
+#
+#   SEARXNG_URL=http://localhost:8888
+#
+# IMPORTANT - one manual step after first start: SearXNG ships with JSON
+# output disabled by default (it's meant for public instances, where an
+# open JSON API gets scraped). bot/websearch.py needs it. After the
+# container's run once (so the settings.yml below exists), edit it:
+#
+#   docker compose -f docker-compose.searxng.yml exec searxng \
+#     sh -c "echo '  formats: [html, json]' "
+#
+# ...or simpler, just exec into the container and add this under the
+# `search:` key in /etc/searxng/settings.yml, then restart the container:
+#
+#   search:
+#     formats:
+#       - html
+#       - json
+#
+# That's it - no signup, no key, no billing. SearXNG itself queries
+# several public search backends in aggregate; you're not calling any
+# single provider's API directly. See https://docs.searxng.org for
+# tuning which backends it uses (settings.yml, mounted below).
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: novelbot-searxng
+    ports:
+      - "8888:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      # Required so SearXNG's JSON output format (used by bot/websearch.py)
+      # is enabled - it's disabled by default for public instances.
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+    volumes:
+      - searxng-data:/etc/searxng
+    restart: unless-stopped
+
+volumes:
+  searxng-data:

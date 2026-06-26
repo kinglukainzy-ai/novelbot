@@ -241,7 +241,7 @@ def _build_tools(brain):
         only when the question genuinely needs live external information.
         Do NOT use this for anything about the user's own tracked library;
         the other tools already cover that with zero cost or delay."""
-        return _gemini_web_lookup(query)
+        return _web_lookup(query)
 
     return [
         add_novel, add_anime, list_library, set_status,
@@ -325,13 +325,28 @@ BACKOFF_BASE = 2  # seconds; doubles each attempt: 2s, 4s, 8s
 GEMINI_FALLBACK_MODELS = ["gemini-2.5-flash-lite"]  # tried after the primary model
 
 
+def _web_lookup(query: str) -> str:
+    """Backs the web_lookup tool. Tries the self-hosted SearXNG instance
+    first (no API key, no quota - see bot/websearch.py); only falls back
+    to Gemini if SEARXNG_URL was never set up, so existing setups that
+    haven't migrated yet don't lose the feature outright."""
+    from bot import websearch
+    if websearch.is_configured():
+        result = websearch.search_and_summarize(query)
+        if result is not None:
+            return result
+        # SearXNG is up but this particular query came back empty/failed -
+        # don't silently fall through to Gemini here; that would mask a
+        # real "no results" as success on a different backend.
+        return "(no results found)"
+    return _gemini_web_lookup(query)
+
+
 def _gemini_web_lookup(query: str) -> str:
-    """The one remaining path to Gemini from the local-orchestrated agent -
-    only reached when the local model calls the web_lookup tool. Tries the
-    configured model first, with retry/backoff for transient overload, then
-    falls back to a second model (separate quota pool) before giving up -
-    this is deliberately more resilient than a single model/attempt, since
-    it's the one tool that's allowed to actually fail the whole request."""
+    """Legacy path to Gemini - only reached when SEARXNG_URL isn't set up.
+    Tries the configured model first, with retry/backoff for transient
+    overload, then falls back to a second model (separate quota pool)
+    before giving up."""
     client = _get_client()
     if client is None:
         return "Web lookup unavailable - no GEMINI_API_KEY configured."

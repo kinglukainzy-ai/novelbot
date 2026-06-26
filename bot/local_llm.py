@@ -113,3 +113,46 @@ def extract_chapter_marker(title: str, page_text: str) -> str | None:
         return None
 
     return out
+
+
+def answer_from_search_results(query: str, snippet_block: str) -> str | None:
+    """Turns raw SearXNG result snippets into a direct answer to the
+    original query - the local-model equivalent of what Gemini's
+    google_search tool used to do in one call. Same text-in/text-out shape
+    as extract_chapter_marker: no internet access needed here, since the
+    actual web search already happened upstream in websearch.py.
+
+    Returns None - never raises - on any failure, so callers can fall back
+    to handing back the raw snippets instead."""
+    model = os.getenv("OLLAMA_MODEL", "phi4-mini")
+    system_msg = (
+        "You answer questions using ONLY the search result snippets you "
+        "are given. You never invent facts beyond what's in the snippets. "
+        "If the snippets don't actually answer the question, say so plainly."
+    )
+    user_msg = (
+        f"Question: {query}\n\n"
+        f"Search result snippets:\n---\n{snippet_block[:6000]}\n---\n\n"
+        "Answer the question in 2-4 sentences using only the information "
+        "above. Mention which source it came from if relevant."
+    )
+    try:
+        resp = requests.post(
+            f"{_ollama_host()}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "options": {"temperature": 0.3, "num_predict": 250},
+                "stream": False,
+            },
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        out = (resp.json().get("message", {}).get("content") or "").strip()
+    except (requests.RequestException, ValueError, KeyError):
+        return None
+
+    return out or None

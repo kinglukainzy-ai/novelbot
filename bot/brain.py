@@ -472,15 +472,18 @@ class Brain:
             return "Couldn't work out the schedule - try /check to run one now."
 
     def _cmd_sources(self, _):
-        from bot import local_llm
+        from bot import local_llm, websearch
         lines = ["<b>Scraper tiers</b>"]
         lines.append("1-2. Selector / heuristic — always available (plain HTTP, no API key)")
         local_ok = local_llm.is_configured()
         lines.append(f"3. Local LLM (page-read) — {'✅ available' if local_ok else '❌ not running (OLLAMA_HOST)'}")
-        gemini_ok = bool(os.getenv("GEMINI_API_KEY"))
-        lines.append(f"4a. Gemini web search — {'✅ configured' if gemini_ok else '❌ no GEMINI_API_KEY'}")
-        tavily_ok = bool(os.getenv("TAVILY_API_KEY"))
-        lines.append(f"4b. Tavily web search (backup) — {'✅ configured' if tavily_ok else '❌ no TAVILY_API_KEY'}")
+        searxng_ok = websearch.is_configured()
+        lines.append(f"4. SearXNG web search (self-hosted, no API key) — {'✅ available' if searxng_ok else '❌ not running (SEARXNG_URL)'}")
+        if not searxng_ok:
+            gemini_ok = bool(os.getenv("GEMINI_API_KEY"))
+            lines.append(f"4a. Legacy: Gemini web search — {'✅ configured' if gemini_ok else '❌ no GEMINI_API_KEY'}")
+            tavily_ok = bool(os.getenv("TAVILY_API_KEY"))
+            lines.append(f"4b. Legacy: Tavily web search (backup) — {'✅ configured' if tavily_ok else '❌ no TAVILY_API_KEY'}")
         novels = [i for i in self.db.list_items(type_="novel")]
         domains = sorted({_domain_of(i["url"]) for i in novels if i.get("url")})
         if domains:
@@ -743,9 +746,10 @@ class Brain:
                     "The page may be permanently down, geo-blocked, or behind a login wall.\n"
                     + hint
                 )
-            if not os.getenv("GEMINI_API_KEY") and not os.getenv("TAVILY_API_KEY"):
+            from bot import websearch
+            if not websearch.is_configured() and not os.getenv("GEMINI_API_KEY") and not os.getenv("TAVILY_API_KEY"):
                 return (
-                    f"❌ Still broken: #{item_id} {item['title']} — no GEMINI_API_KEY or "
+                    f"❌ Still broken: #{item_id} {item['title']} — no SEARXNG_URL, GEMINI_API_KEY, or "
                     "TAVILY_API_KEY set, so tier 4 (web search) was effectively a no-op.\n"
                     "Set one and run /fix again, or: " + hint
                 )
