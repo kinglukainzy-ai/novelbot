@@ -8,7 +8,7 @@ import datetime
 
 from bot.storage import Storage
 from bot.scraper import (
-    fetch_snapshot, fetch_snapshot_ai, fetch_snapshot_websearch,
+    fetch_snapshot, fetch_snapshot_multi, fetch_snapshot_ai, fetch_snapshot_websearch,
     parse_chapter_number, ScrapeError, PageUnreachable,
 )
 from bot import anilist, novelfire
@@ -22,6 +22,32 @@ def _domain_of(url: str) -> str:
         return urlparse(url).netloc or url
     except Exception:
         return url
+
+
+def _backup_urls(item) -> list[str]:
+    """Parses the comma-separated backup_urls column into a clean list,
+    skipping anything blank (e.g. an item with the column never set)."""
+    raw = (item.get("backup_urls") or "").strip()
+    if not raw:
+        return []
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def _promote_if_backup_won(db, item, working_url: str, tried_urls: list[str]):
+    """If a backup mirror is the one that actually worked (not the primary
+    url on file), swap it in as the new primary and demote the old primary
+    plus any other still-untried backups back into the backup list. This
+    is what makes the feature self-healing instead of just "try a list
+    every time" - once a mirror proves itself, it stops being the slow
+    second choice."""
+    if working_url == item["url"]:
+        return  # primary worked, nothing to promote
+    remaining = [u for u in tried_urls if u != working_url]
+    db.update_item(item["id"], url=working_url, backup_urls=",".join(remaining))
+    db.log_event(
+        item["id"], "source_promoted",
+        f"{working_url} replaced {item['url']} as primary (was unreachable)"
+    )
 
 HELP_TEXT = """\
 <b>🪶 Thoth</b> — your novel &amp; anime tracker
@@ -450,9 +476,53 @@ class Brain:
             self.db.update_item(item_id, last_snapshot=snap, last_chapter_num=parse_chapter_number(snap), broken=0)
             return f"Selector updated for #{item_id} {item['title']}\nCurrent latest: {snap}"
 
+        elif field == "addsource":
+            if len(parts) < 3 or not parts[2].strip():
+                return "Format: /set &lt;id&gt; addsource &lt;backup url&gt;"
+            new_url = parts[2].strip()
+            if new_url == item["url"]:
+                return "That's already the primary URL for this novel."
+            backups = _backup_urls(item)
+            if new_url in backups:
+                return f"That URL is already a backup source for #{item_id} {item['title']}."
+            backups.append(new_url)
+            self.db.update_item(item_id, backup_urls=",".join(backups))
+            self.db.log_event(item_id, "backup_source_added", new_url)
+            return (
+                f"Added backup source for #{item_id} {item['title']} "
+                f"({len(backups)} backup(s) on file now).\n"
+                "It'll be tried automatically (cheap selector/heuristic only - "
+                "no AI cost) if the primary URL ever fails, and gets promoted "
+                "to primary if it's the one that actually works."
+            )
+
+        elif field == "removesource":
+            if len(parts) < 3 or not parts[2].strip():
+                return "Format: /set &lt;id&gt; removesource &lt;backup url&gt;"
+            target = parts[2].strip()
+            backups = _backup_urls(item)
+            if target not in backups:
+                return f"'{target}' isn't a backup source on #{item_id} {item['title']}."
+            backups.remove(target)
+            self.db.update_item(item_id, backup_urls=",".join(backups))
+            self.db.log_event(item_id, "backup_source_removed", target)
+            return f"Removed that backup source from #{item_id} {item['title']} ({len(backups)} left)."
+
+        elif field == "sources":
+            backups = _backup_urls(item)
+            lines = [f"<b>Sources for #{item_id} {item['title']}</b>", f"Primary: {item['url']}"]
+            if backups:
+                lines += [f"Backup {i+1}: {u}" for i, u in enumerate(backups)]
+            else:
+                lines.append("No backup sources on file - add one with /set &lt;id&gt; addsource &lt;url&gt;")
+            return "\n".join(lines)
+
         else:
             return ("Format: /set &lt;id&gt; url &lt;new url&gt;\n"
-                     "or: /set &lt;id&gt; selector &lt;new css selector|clear&gt;")
+                     "or: /set &lt;id&gt; selector &lt;new css selector|clear&gt;\n"
+                     "or: /set &lt;id&gt; addsource &lt;backup url&gt;\n"
+                     "or: /set &lt;id&gt; removesource &lt;backup url&gt;\n"
+                     "or: /set &lt;id&gt; sources")
 
     def _cmd_next_check(self, _):
         last_at = self.db.get_setting("last_check_at")
@@ -626,17 +696,10 @@ class Brain:
             still_broken = 0
             for item in novels:
                 snap, method = None, None
-                try:
-                    snap = fetch_snapshot(item["url"], item.get("selector"))
-                    method = "selector" if item.get("selector") else "heuristic"
-                except ScrapeError:
-                    pass
-                if snap is None and item.get("selector"):
-                    try:
-                        snap = fetch_snapshot(item["url"], None)
-                        method = "heuristic"
-                    except ScrapeError:
-                        pass
+                urls = [item["url"]] + _backup_urls(item)
+                snap, method, working_url = fetch_snapshot_multi(urls, item.get("selector"))
+                if snap is not None:
+                    _promote_if_backup_won(self.db, item, working_url, urls)
                 if snap is None:
                     try:
                         snap = fetch_snapshot_ai(item["url"], item["title"])
@@ -703,20 +766,12 @@ class Brain:
         snap = None
         method = None
 
-        # Tier 1: selector
-        try:
-            snap = fetch_snapshot(item["url"], item.get("selector"))
-            method = "selector" if item.get("selector") else "heuristic"
-        except ScrapeError:
-            pass
-
-        # Tier 2: heuristic (no selector)
-        if snap is None and item.get("selector"):
-            try:
-                snap = fetch_snapshot(item["url"], None)
-                method = "heuristic"
-            except ScrapeError:
-                pass
+        # Tier 1/2: selector then heuristic, tried against the primary url
+        # and any backup mirrors on file - stops at the first one that works.
+        urls = [item["url"]] + _backup_urls(item)
+        snap, method, working_url = fetch_snapshot_multi(urls, item.get("selector"))
+        if snap is not None:
+            _promote_if_backup_won(self.db, item, working_url, urls)
 
         # Tier 3: local LLM reads the page text
         page_unreachable = False
@@ -857,20 +912,17 @@ class Brain:
                     # Confirmed: site's up, just nothing new yet. Nothing more to do.
                     return None
 
-        # Tier 1/2: selector, then no-selector heuristic. Cheap (plain HTTP),
+        # Tier 1/2: selector, then no-selector heuristic, tried against the
+        # primary url and any backup mirrors on file. Cheap (plain HTTP),
         # so these always run every cycle regardless of broken status - no
         # reason to throttle a free check that might heal itself for free.
         if snap is None:
-            try:
-                snap = fetch_snapshot(item["url"], item.get("selector"))
-            except ScrapeError:
+            urls = [item["url"]] + _backup_urls(item)
+            snap, _method, working_url = fetch_snapshot_multi(urls, item.get("selector"))
+            if snap is not None:
+                _promote_if_backup_won(self.db, item, working_url, urls)
+            else:
                 selector_failed = True
-
-            if selector_failed and item.get("selector"):
-                try:
-                    snap = fetch_snapshot(item["url"], None)
-                except ScrapeError:
-                    pass  # genuine failure, handled below
 
         # Throttle: tiers 3/4 are the expensive ones (local LLM inference,
         # external API calls). Once an item is confirmed broken, retrying

@@ -90,6 +90,7 @@ class Storage:
             "last_read_at": "TEXT",
             "last_broken_retry_at": "TEXT",  # throttles tier 3/4 retries on confirmed-broken items
             "last_chapter_num": "INTEGER",   # parsed chapter number, used by the tier-0 increment probe
+            "backup_urls": "TEXT",           # comma-separated mirror URLs, tried before AI tiers if the primary url fails
         }
         for col, coltype in new_cols.items():
             if col not in existing:

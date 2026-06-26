@@ -84,6 +84,38 @@ def fetch_snapshot(url: str, selector: str | None = None) -> str:
     return candidates[0]
 
 
+def fetch_snapshot_multi(urls: list[str], selector: str | None = None):
+    """Tries each URL in order (primary first, then any backup mirrors),
+    selector first then the no-selector heuristic on each one, stopping at
+    the first that actually works. This is still tier 1/2 - cheap plain
+    HTTP, no AI involved - just spread across however many sources are on
+    file instead of giving up on the first one.
+
+    Returns (snapshot, method, working_url) for the first source that
+    works, or (None, None, None) if every source failed. A backup mirror
+    succeeding when the primary didn't is exactly the case the caller
+    should treat as "consider promoting this to the primary URL" - that
+    decision lives in brain.py since it needs to touch the DB.
+    """
+    for url in urls:
+        snap = None
+        method = None
+        try:
+            snap = fetch_snapshot(url, selector)
+            method = "selector" if selector else "heuristic"
+        except ScrapeError:
+            pass
+        if snap is None and selector:
+            try:
+                snap = fetch_snapshot(url, None)
+                method = "heuristic"
+            except ScrapeError:
+                pass
+        if snap is not None:
+            return snap, method, url
+    return None, None, None
+
+
 def snapshot_hash(snapshot: str) -> str:
     return hashlib.sha256(snapshot.encode("utf-8")).hexdigest()[:16]
 
