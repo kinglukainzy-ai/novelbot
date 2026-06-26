@@ -410,7 +410,7 @@ def _function_to_ollama_schema(fn) -> dict:
 
 
 # Words that signal the message actually needs library data / a tool call.
-# If none of these appear, we skip attaching the 21-tool schema entirely -
+# If none of these appear, we skip attaching the tool schema entirely -
 # that schema alone costs ~85s of extra CPU prompt-eval per turn (measured:
 # 3s with no tools vs 90s with tools, for the literal same "hey"), so paying
 # it for plain small talk is pure waste. This is a heuristic, not perfect -
@@ -430,11 +430,62 @@ def _needs_tools(text: str) -> bool:
     return any(word in lowered for word in _TOOL_TRIGGER_WORDS)
 
 
+# Maps trigger words -> the small set of tool names actually relevant to
+# that intent. Measured overhead (time_tool_overhead_subset.py) scales
+# super-linearly with tool count on phi4-mini/Ollama: 1 tool ~10s, 5 tools
+# ~16s, 21 tools ~72s for the same prompt. So once we know we need *some*
+# tool, it's worth narrowing further to just the relevant handful instead
+# of always sending all 21 - that's the difference between ~16s and ~72s.
+#
+# Multiple groups can match; their tool sets are unioned. If nothing
+# matches (shouldn't happen if _needs_tools already said yes, but be
+# defensive), fall back to the full tool list rather than risk leaving out
+# something the model needs.
+_TOOL_GROUPS = {
+    ("add", "track"): ["add_novel", "add_anime"],
+    ("list", "library", "reading", "watching", "book"): ["list_library", "get_library_data"],
+    ("rate", "rating"): ["rate_item"],
+    ("status",): ["set_status"],
+    ("progress", "chapter"): ["set_progress"],
+    ("tag",): ["add_tag"],
+    ("note",): ["set_note"],
+    ("remove", "delete"): ["remove_item"],
+    ("find", "search"): ["find_items", "web_lookup"],
+    ("top", "best", "highest", "lowest", "recommend", "suggest"): ["get_library_data"],
+    ("broken", "fix", "source"): ["force_fix_scraper", "clear_broken_flag", "get_broken"],
+    ("stats",): ["get_stats"],
+    ("history", "update", "next"): ["get_history", "get_recent", "check_for_updates"],
+    ("anime", "novel"): ["add_novel", "add_anime", "get_item_details"],
+}
+
+
+def _select_tool_names(text: str) -> set:
+    """Returns the union of tool names relevant to every trigger-word group
+    found in text. Empty set means no group matched (caller should fall
+    back to the full tool list)."""
+    lowered = text.lower()
+    selected = set()
+    for words, tool_names in _TOOL_GROUPS.items():
+        if any(word in lowered for word in words):
+            selected.update(tool_names)
+    return selected
+
+
 def _run_ollama_agent(brain, user_id: int, text: str) -> str:
     from bot import local_llm
 
     use_tools = _needs_tools(text)
-    py_tools = _build_tools(brain) if use_tools else []
+    if use_tools:
+        all_tools = _build_tools(brain)
+        selected_names = _select_tool_names(text)
+        if selected_names:
+            py_tools = [fn for fn in all_tools if fn.__name__ in selected_names]
+        else:
+            # _needs_tools said yes but no group matched closely enough -
+            # safer to send everything than risk missing the right tool.
+            py_tools = all_tools
+    else:
+        py_tools = []
     tool_map = {fn.__name__: fn for fn in py_tools}
     ollama_tools = [_function_to_ollama_schema(fn) for fn in py_tools]
 
