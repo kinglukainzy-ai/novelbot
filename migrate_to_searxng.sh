@@ -108,14 +108,21 @@ else:
         r"formats:\s*\n(?:\s*-\s*\S+\s*\n)+", add_json, content, count=1
     )
     if n == 0:
-        # No `formats:` key at all - default is html-only; add the key
-        # right under `search:`.
+        # `search:` key exists but has no `formats:` list under it yet -
+        # insert one right after the `search:` line.
         new_content, n = re.subn(
             r"(^search:\s*\n)", r"\1  formats:\n    - html\n    - json\n",
             content, count=1, flags=re.MULTILINE,
         )
-        if n == 0:
-            raise SystemExit("Couldn't find a `search:` section in settings.yml - inspect it manually.")
+    if n == 0:
+        # No `search:` section in the file at all (common on a fresh
+        # container - the on-disk file can be a minimal template that
+        # relies on use_default_settings: true for everything else).
+        # Append a new top-level section rather than giving up.
+        if not content.endswith("\n"):
+            content += "\n"
+        new_content = content + "search:\n  formats:\n    - html\n    - json\n"
+        n = 1
 
     with open(PATH, "w") as f:
         f.write(new_content)
