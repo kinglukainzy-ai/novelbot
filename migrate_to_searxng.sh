@@ -86,22 +86,40 @@ echo "    container is up."
 # ---------------------------------------------------------------------
 echo "==> Enabling JSON API in settings.yml..."
 "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" exec -T searxng python3 - <<'PYEOF'
-import yaml
+import re
 
 PATH = "/etc/searxng/settings.yml"
 with open(PATH) as f:
-    cfg = yaml.safe_load(f) or {}
+    content = f.read()
 
-cfg.setdefault("search", {})
-formats = cfg["search"].get("formats") or ["html"]
-if "json" not in formats:
-    formats.append("json")
-cfg["search"]["formats"] = formats
+# Already enabled - nothing to do.
+if re.search(r"formats:\s*\n(?:\s*-\s*\S+\s*\n)*\s*-\s*json\s*\n?", content):
+    print("    json format already enabled")
+else:
+    # Common case: a `formats:` list already exists under `search:` (the
+    # default settings.yml ships with `formats:\n    - html`). Add json
+    # to that existing list rather than assuming exact indentation.
+    def add_json(m):
+        block = m.group(0)
+        indent = re.search(r"\n(\s*)-\s*\S+", block).group(1)
+        return block.rstrip("\n") + f"\n{indent}- json\n"
 
-with open(PATH, "w") as f:
-    yaml.safe_dump(cfg, f, sort_keys=False)
+    new_content, n = re.subn(
+        r"formats:\s*\n(?:\s*-\s*\S+\s*\n)+", add_json, content, count=1
+    )
+    if n == 0:
+        # No `formats:` key at all - default is html-only; add the key
+        # right under `search:`.
+        new_content, n = re.subn(
+            r"(^search:\s*\n)", r"\1  formats:\n    - html\n    - json\n",
+            content, count=1, flags=re.MULTILINE,
+        )
+        if n == 0:
+            raise SystemExit("Couldn't find a `search:` section in settings.yml - inspect it manually.")
 
-print(f"    search.formats is now: {formats}")
+    with open(PATH, "w") as f:
+        f.write(new_content)
+    print("    added 'json' to search.formats")
 PYEOF
 
 echo "==> Restarting SearXNG so the setting takes effect..."
