@@ -501,10 +501,11 @@ def _select_tool_names(text: str) -> set:
 def _parse_text_tool_calls(content: str, tool_map: dict) -> list | None:
     """Some small models occasionally write a tool call out as plain JSON
     text in the message content instead of using Ollama's structured
-    tool_calls field, e.g.:
+    tool_calls field. Observed shapes (phi4-mini has produced both):
 
         [{"name": "get_library_data", "arguments": {"item_type": ""}}]
         {"name": "get_stats", "arguments": {}}
+        {"get_library_data": {"item_type": "", "status": ""}}
 
     Returns a list shaped like Ollama's real tool_calls (each item having a
     "function": {"name", "arguments"} dict) if content parses as one or more
@@ -526,6 +527,18 @@ def _parse_text_tool_calls(content: str, tool_map: dict) -> list | None:
     try:
         parsed = json.loads(candidate)
     except (ValueError, TypeError):
+        return None
+
+    # Shape: {"tool_name": {arg dict}, "other_tool": {arg dict}, ...} - the
+    # whole dict's keys ARE the tool names, no "name"/"arguments" wrapper.
+    # Only treat it this way if every key matches a real tool and every
+    # value is a dict - otherwise this branch would misfire on something
+    # like {"name": "x", "arguments": {}} itself (which the other branch
+    # below already handles) or on an ordinary reply that happens to be a
+    # JSON object.
+    if isinstance(parsed, dict) and parsed and "name" not in parsed:
+        if all(isinstance(v, dict) and k in tool_map for k, v in parsed.items()):
+            return [{"function": {"name": k, "arguments": v}} for k, v in parsed.items()]
         return None
 
     items = parsed if isinstance(parsed, list) else [parsed]
