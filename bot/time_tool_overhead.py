@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 time_tool_overhead.py - measures exactly how much latency Ollama adds
-when the bot's full 21-tool schema is attached vs a plain call with none.
+when the bot's full 21-tool schema is attached vs a plain call with none,
+and separately how long a real plain-chat message ("hey") takes with the
+tightened no-tools options.
 
 Run this ON THE SERVER, inside the bot's venv, from the repo root:
 
-    .venv/bin/python time_tool_overhead.py
+    .venv/bin/python bot/time_tool_overhead.py
 
 It uses the bot's *real* _build_tools()/_function_to_ollama_schema() code
 - not a guess at tool count/size - so the number it prints is the actual
@@ -24,15 +26,15 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "phi4-mini")
 
 
-def timed_call(label, tools=None):
+def timed_call(label, user_text, tools=None, use_tools_options=True):
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": ai_agent.SYSTEM_INSTRUCTION},
-            {"role": "user", "content": "add the novel Solo Leveling"},
+            {"role": "user", "content": user_text},
         ],
         "stream": False,
-        "options": ai_agent.OLLAMA_CHAT_OPTIONS,
+        "options": ai_agent._ollama_options(use_tools=use_tools_options),
         "keep_alive": ai_agent.OLLAMA_KEEP_ALIVE,
     }
     if tools:
@@ -59,7 +61,18 @@ py_tools = ai_agent._build_tools(fake_brain)
 ollama_tools = [ai_agent._function_to_ollama_schema(fn) for fn in py_tools]
 print(f"Built {len(ollama_tools)} tool schemas from the bot's real tool list.\n")
 
-no_tools_time = timed_call("Without tools attached")
-with_tools_time = timed_call("With full tool schema attached", tools=ollama_tools)
+no_tools_time = timed_call(
+    "Without tools attached (tools-style msg)", "add the novel Solo Leveling",
+    use_tools_options=False,
+)
+with_tools_time = timed_call(
+    "With full tool schema attached", "add the novel Solo Leveling",
+    tools=ollama_tools, use_tools_options=True,
+)
+hey_time = timed_call(
+    "Real plain-chat message, no tools (this is what '/ask hey' actually pays)",
+    "hey", use_tools_options=False,
+)
 
 print(f"\nTool-schema overhead: {with_tools_time - no_tools_time:.1f}s extra")
+print(f"'/ask hey' end-to-end (post-fix settings): {hey_time:.1f}s")
