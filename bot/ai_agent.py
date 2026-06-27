@@ -381,11 +381,35 @@ def _gemini_web_lookup(query: str) -> str:
 _PY_TYPE_TO_JSON = {str: "string", int: "integer", float: "number", bool: "boolean"}
 OLLAMA_MAX_TOOL_ITERATIONS = 6
 OLLAMA_CHAT_TIMEOUT = 180
-# Caps output length so a rambling response can't run unbounded on CPU, and
-# keeps the model loaded in RAM between requests so we don't repay the
-# multi-second reload cost on every single /ask.
-OLLAMA_CHAT_OPTIONS = {"num_predict": 300, "temperature": 0.4}
+
+# Generation is the dominant cost on small/CPU-only VMs (each extra output
+# token is another full forward pass), so num_predict is the single biggest
+# lever we have - bigger than the tool-schema savings below. Plain small talk
+# ("hey", "thanks", "lol") never needs a long reply, so it gets a much
+# tighter cap than tool-driven turns, which need room to synthesize a tool
+# result into prose.
+OLLAMA_CHAT_OPTIONS_PLAIN = {"num_predict": 80, "temperature": 0.4}
+OLLAMA_CHAT_OPTIONS_TOOLS = {"num_predict": 300, "temperature": 0.4}
+# Backwards-compat alias (some callers/tests may still reference this name).
+OLLAMA_CHAT_OPTIONS = OLLAMA_CHAT_OPTIONS_TOOLS
+
+# num_ctx bounds how much context the model has to re-process every turn -
+# left unset, some models default higher than this bot ever needs (history
+# is capped at HISTORY_TURNS*2 short messages + one system prompt), which
+# just means slower prompt-eval for no benefit. num_thread pins Ollama to
+# every vCPU the VM actually has - left unset it doesn't always use them
+# all, which matters a lot on a 1-4 vCPU free-tier box.
+OLLAMA_NUM_CTX = 2048
+OLLAMA_NUM_THREAD = max(os.cpu_count() or 1, 1)
+
 OLLAMA_KEEP_ALIVE = "30m"
+
+
+def _ollama_options(use_tools: bool) -> dict:
+    base = dict(OLLAMA_CHAT_OPTIONS_TOOLS if use_tools else OLLAMA_CHAT_OPTIONS_PLAIN)
+    base["num_ctx"] = OLLAMA_NUM_CTX
+    base["num_thread"] = OLLAMA_NUM_THREAD
+    return base
 
 
 def _function_to_ollama_schema(fn) -> dict:
@@ -505,7 +529,7 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
                     "messages": messages,
                     **({"tools": ollama_tools} if ollama_tools else {}),
                     "stream": False,
-                    "options": OLLAMA_CHAT_OPTIONS,
+                    "options": _ollama_options(use_tools=bool(ollama_tools)),
                     "keep_alive": OLLAMA_KEEP_ALIVE,
                 },
                 timeout=OLLAMA_CHAT_TIMEOUT,
