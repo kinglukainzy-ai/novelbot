@@ -42,10 +42,13 @@ Free Gemini API key (only needed for the web_lookup escape hatch and the
 no-Ollama fallback path): https://aistudio.google.com/apikey
 """
 import inspect
+import logging
 import os
 import time
 import requests
 from collections import deque
+
+logger = logging.getLogger("ai_agent")
 
 # ---------------------------------------------------------------------------
 # Client cache
@@ -498,6 +501,7 @@ def _select_tool_names(text: str) -> set:
 def _run_ollama_agent(brain, user_id: int, text: str) -> str:
     from bot import local_llm
 
+    t_start = time.monotonic()
     use_tools = _needs_tools(text)
     if use_tools:
         all_tools = _build_tools(brain)
@@ -519,9 +523,14 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
 
     model = os.getenv("OLLAMA_MODEL", "phi4-mini")
     host = local_llm._ollama_host()
+    logger.info(
+        f"[timing] /ask {text[:30]!r}: setup done at +{time.monotonic()-t_start:.2f}s "
+        f"(use_tools={use_tools}, n_tools={len(ollama_tools)})"
+    )
 
-    for _ in range(OLLAMA_MAX_TOOL_ITERATIONS):
+    for iteration in range(OLLAMA_MAX_TOOL_ITERATIONS):
         try:
+            t_call = time.monotonic()
             resp = requests.post(
                 f"{host}/api/chat",
                 json={
@@ -536,6 +545,10 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
             )
             resp.raise_for_status()
             data = resp.json()
+            logger.info(
+                f"[timing] /ask {text[:30]!r}: ollama call #{iteration} took "
+                f"{time.monotonic()-t_call:.2f}s (total so far {time.monotonic()-t_start:.2f}s)"
+            )
         except (requests.RequestException, ValueError) as e:
             return f"Local model error: {e}"
 
@@ -588,8 +601,14 @@ def ask(brain, text: str, user_id: int = 0) -> str:
         clear_history(user_id)
         return "Conversation history cleared. Starting fresh."
 
+    t0 = time.monotonic()
     from bot import local_llm
-    if local_llm.is_configured():
+    configured = local_llm.is_configured()
+    logger.info(
+        f"[timing] /ask {text[:30]!r}: is_configured() check took "
+        f"{time.monotonic()-t0:.2f}s (configured={configured})"
+    )
+    if configured:
         return _run_ollama_agent(brain, user_id, text)
 
     return _ask_gemini(brain, text, user_id)
