@@ -498,6 +498,53 @@ def _select_tool_names(text: str) -> set:
     return selected
 
 
+def _parse_text_tool_calls(content: str, tool_map: dict) -> list | None:
+    """Some small models occasionally write a tool call out as plain JSON
+    text in the message content instead of using Ollama's structured
+    tool_calls field, e.g.:
+
+        [{"name": "get_library_data", "arguments": {"item_type": ""}}]
+        {"name": "get_stats", "arguments": {}}
+
+    Returns a list shaped like Ollama's real tool_calls (each item having a
+    "function": {"name", "arguments"} dict) if content parses as one or more
+    such calls AND every name matches a real tool - otherwise returns None
+    so the caller treats the content as an ordinary text reply. The known-
+    tool-name check is what keeps this from misfiring on a normal reply that
+    just happens to contain a JSON-looking fragment.
+    """
+    import json
+    import re
+
+    if not content or "{" not in content:
+        return None
+
+    candidate = content.strip()
+    # Models sometimes wrap this in a code fence - strip it before parsing.
+    candidate = re.sub(r"^```(?:json)?|```$", "", candidate.strip(), flags=re.IGNORECASE).strip()
+
+    try:
+        parsed = json.loads(candidate)
+    except (ValueError, TypeError):
+        return None
+
+    items = parsed if isinstance(parsed, list) else [parsed]
+    if not items:
+        return None
+
+    calls = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        args = item.get("arguments", item.get("parameters", {}))
+        if not name or name not in tool_map or not isinstance(args, dict):
+            return None
+        calls.append({"function": {"name": name, "arguments": args}})
+
+    return calls or None
+
+
 def _run_ollama_agent(brain, user_id: int, text: str) -> str:
     from bot import local_llm
 
@@ -556,10 +603,25 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
         tool_calls = msg.get("tool_calls") or []
 
         if not tool_calls:
-            reply = (msg.get("content") or "").strip() or "(no response)"
-            _append_history(user_id, "user", text)
-            _append_history(user_id, "assistant", reply)
-            return reply
+            content = (msg.get("content") or "").strip()
+            # Small models occasionally write the tool call out as plain JSON
+            # text instead of using Ollama's structured tool_calls field (e.g.
+            # `[{"name": "get_library_data", "arguments": {...}}]`). Treating
+            # that as a final answer means the tool never actually runs and
+            # the user just sees raw JSON. Detect and execute it as if it had
+            # come through properly before giving up and treating it as text.
+            fallback_calls = _parse_text_tool_calls(content, tool_map)
+            if fallback_calls:
+                logger.info(
+                    f"[timing] /ask {text[:30]!r}: model emitted tool call as "
+                    f"text, not via tool_calls field - recovering via fallback parser"
+                )
+                tool_calls = fallback_calls
+            else:
+                reply = content or "(no response)"
+                _append_history(user_id, "user", text)
+                _append_history(user_id, "assistant", reply)
+                return reply
 
         messages.append(msg)
         for call in tool_calls:
