@@ -258,6 +258,17 @@ def _build_tools(brain):
 
 # ---------------------------------------------------------------------------
 # System instruction
+#
+# Used directly by the Gemini fallback path (_ask_gemini) - Gemini has no
+# Modelfile-equivalent baked-persona mechanism, so it still needs this
+# sent as an explicit system message every call.
+#
+# For the Ollama path, this same text is baked into the "thoth" custom
+# model via the repo-root Modelfile instead of being sent from Python -
+# see _run_ollama_agent() below, which deliberately omits a system message
+# when OLLAMA_MODEL points at "thoth". If you edit the persona here, copy
+# the same edit into Modelfile and run `ollama create thoth -f Modelfile`
+# again, or the two will drift apart.
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = (
     "You are Thoth - named for the Egyptian god of writing, knowledge, and "
@@ -391,8 +402,17 @@ OLLAMA_CHAT_TIMEOUT = 180
 # ("hey", "thanks", "lol") never needs a long reply, so it gets a much
 # tighter cap than tool-driven turns, which need room to synthesize a tool
 # result into prose.
+#
+# Tool-calling temperature is lower than plain-chat temperature on purpose:
+# `ollama show phi4-mini` confirms tools is a native capability on this
+# model, so when tool_calls still come back as plain text instead of the
+# structured field (see _parse_text_tool_calls below), the more likely
+# cause is decoding randomness in which-tool/which-arguments selection,
+# not an architecture gap. Lower temperature trades a little creativity
+# for more consistent tool selection; the prose-after-a-tool-result turn
+# doesn't need creativity anyway - it's summarizing data, not improvising.
 OLLAMA_CHAT_OPTIONS_PLAIN = {"num_predict": 80, "temperature": 0.4}
-OLLAMA_CHAT_OPTIONS_TOOLS = {"num_predict": 300, "temperature": 0.4}
+OLLAMA_CHAT_OPTIONS_TOOLS = {"num_predict": 300, "temperature": 0.2}
 # Backwards-compat alias (some callers/tests may still reference this name).
 OLLAMA_CHAT_OPTIONS = OLLAMA_CHAT_OPTIONS_TOOLS
 
@@ -577,9 +597,16 @@ def _run_ollama_agent(brain, user_id: int, text: str) -> str:
     tool_map = {fn.__name__: fn for fn in py_tools}
     ollama_tools = [_function_to_ollama_schema(fn) for fn in py_tools]
 
+    # No system message sent here on purpose: Thoth's persona/instructions
+    # are baked into the "thoth" custom Ollama model via the repo-root
+    # Modelfile (see THOTH_MODELFILE_INTEGRATION.md). Sending
+    # SYSTEM_INSTRUCTION again from here would just duplicate it in every
+    # prompt - wasted tokens, and a direct latency cost on a CPU-only box.
+    # If OLLAMA_MODEL ever points at a bare base model (not "thoth")
+    # instead, the persona will be silently absent - that's expected, not
+    # a bug; re-point OLLAMA_MODEL at "thoth" to restore it.
     history = _get_history(user_id)
-    messages = ([{"role": "system", "content": SYSTEM_INSTRUCTION}]
-                + history + [{"role": "user", "content": text}])
+    messages = history + [{"role": "user", "content": text}]
 
     model = os.getenv("OLLAMA_MODEL", "phi4-mini")
     host = local_llm._ollama_host()
